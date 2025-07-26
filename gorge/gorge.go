@@ -64,20 +64,33 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 
 	prefixedKey := c.prefixedKey(key)
 
+	// L1 Check
+	if val, found := c.l1.Get(prefixedKey); found {
+		c.opts.Metrics.IncL1Hits()
+		pl := val.(payload.CachePayload[T])
+		if pl.IsNil {
+			c.opts.Logger.Debug("L1 cache hit (negative)", "key", prefixedKey)
+			return zero, ErrNotFound
+		}
+		if c.opts.EnableStaleWhileRevalidate && pl.IsStale(c.opts.StaleTTL) {
+			c.opts.Logger.Debug("L1 cache hit (stale), refreshing in background", "key", prefixedKey)
+			go c.refresh(context.Background(), prefixedKey, ttl, fn)
+		}
+		c.opts.Logger.Debug("L1 cache hit", "key", prefixedKey)
+		return pl.Data, nil
+	}
+	c.opts.Metrics.IncL1Misses()
+
+	// Use singleflight for L2/DB access.
+	// The closure will always return a (payload.CachePayload[T], error) for consistency.
 	res, err, _ := c.sf.Do(prefixedKey, func() (interface{}, error) {
-		// 1. L1 Cache Check
+		// Re-check L1 inside singleflight.
 		if val, found := c.l1.Get(prefixedKey); found {
 			c.opts.Metrics.IncL1Hits()
-			c.opts.Logger.Debug("L1 cache hit", "key", prefixedKey)
-			pl := val.(payload.CachePayload[T])
-			if pl.IsNil {
-				return nil, ErrNotFound
-			}
-			return pl.Data, nil
+			return val.(payload.CachePayload[T]), nil
 		}
-		c.opts.Metrics.IncL1Misses()
 
-		// 2. L2 Cache & Distributed Lock Loop
+		// L2 Cache & Distributed Lock Loop
 		for i := 0; i < c.opts.LockRetries; i++ {
 			lockTTLInSeconds := int(c.opts.LockTTL.Seconds())
 			res, err := c.lockAndGetScript.Run(ctx, c.l2, []string{prefixedKey}, c.ownerID, lockTTLInSeconds).Result()
@@ -86,19 +99,21 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 				return nil, err
 			}
 
-			results := res.([]interface{})
-			value, status := results[0], results[1].(string)
+			results, ok := res.([]interface{})
+			if !ok || len(results) < 2 {
+				c.opts.Logger.Warn("Unexpected response from lockAndGet script, proceeding to DB", "key", prefixedKey, "response", res)
+				return c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
+			}
 
+			value, status := results[0], results[1].(string)
 			switch status {
 			case "HIT":
 				c.opts.Metrics.IncL2Hits()
 				c.opts.Logger.Debug("L2 cache hit", "key", prefixedKey)
 				return c.handleL2Hit(ctx, prefixedKey, value.(string), ttl, fn)
-
 			case "ACQUIRED_LOCK":
 				c.opts.Logger.Debug("Acquired distributed lock", "key", prefixedKey, "owner", c.ownerID)
 				return c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
-
 			case "LOCKED_BY_OTHER":
 				c.opts.Logger.Debug("Key is locked by another instance. Waiting...", "key", prefixedKey)
 				time.Sleep(c.opts.LockSleep)
@@ -111,31 +126,50 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 	if err != nil {
 		return zero, err
 	}
-	return res.(T), nil
+	pl := res.(payload.CachePayload[T])
+
+	// Ensure the result from the singleflight is stored in the local L1 cache.
+	// This handles the case where this goroutine received a cached result from another
+	// goroutine via singleflight, and therefore didn't execute the L1 set logic inside the closure.
+	if _, found := c.l1.Get(prefixedKey); !found {
+		var l1TTL time.Duration
+		if pl.IsNil {
+			l1TTL = c.opts.NegativeCacheTTL
+		} else {
+			remainingTTL := time.Until(pl.ExpiresAt)
+			l1TTL = min(c.opts.L1TTL, remainingTTL)
+		}
+
+		if l1TTL > 0 {
+			c.l1.SetWithTTL(prefixedKey, pl, 1, l1TTL)
+		}
+	}
+
+	if pl.IsNil {
+		return zero, ErrNotFound
+	}
+	return pl.Data, nil
 }
 
-func (c *Cache[T]) handleL2Hit(ctx context.Context, prefixedKey, l2Val string, ttl time.Duration, fn func(ctx context.Context) (T, error)) (T, error) {
+func (c *Cache[T]) handleL2Hit(ctx context.Context, prefixedKey, l2Val string, ttl time.Duration, fn func(ctx context.Context) (T, error)) (interface{}, error) {
 	var pl payload.CachePayload[T]
 	if err := c.opts.Serializer.Unmarshal([]byte(l2Val), &pl); err != nil {
 		c.opts.Logger.Error("Failed to unmarshal L2 data, re-fetching from DB", "key", prefixedKey, "error", err)
 		return c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
 	}
 
-	c.l1.SetWithTTL(prefixedKey, pl, 1, c.opts.L1TTL)
-	if pl.IsNil {
-		var zero T
-		return zero, ErrNotFound
+	remainingTTL := time.Until(pl.ExpiresAt)
+	if remainingTTL > 0 {
+		c.l1.SetWithTTL(prefixedKey, pl, 1, min(c.opts.L1TTL, remainingTTL))
 	}
 
-	keyTTL, ttlErr := c.l2.TTL(ctx, prefixedKey).Result()
-	if ttlErr == nil && c.opts.EnableStaleWhileRevalidate && keyTTL < c.opts.StaleTTL {
-		c.opts.Logger.Debug("Returning stale data and refreshing in background", "key", prefixedKey, "remainingTTL", keyTTL)
+	if c.opts.EnableStaleWhileRevalidate && pl.IsStale(c.opts.StaleTTL) {
 		go c.refresh(context.Background(), prefixedKey, ttl, fn)
 	}
-	return pl.Data, nil
+	return pl, nil
 }
 
-func (c *Cache[T]) fetchFromDBAndSet(ctx context.Context, prefixedKey string, ttl time.Duration, fn func(ctx context.Context) (T, error)) (T, error) {
+func (c *Cache[T]) fetchFromDBAndSet(ctx context.Context, prefixedKey string, ttl time.Duration, fn func(ctx context.Context) (T, error)) (interface{}, error) {
 	c.opts.Metrics.IncDBFetches()
 	dbVal, err := fn(ctx)
 	if err != nil {
@@ -143,16 +177,15 @@ func (c *Cache[T]) fetchFromDBAndSet(ctx context.Context, prefixedKey string, tt
 		if errors.Is(err, ErrNotFound) {
 			pl := payload.CachePayload[T]{IsNil: true}
 			c.setCacheAndUnlock(ctx, prefixedKey, pl, c.opts.NegativeCacheTTL)
-		} else {
-			c.l2.HDel(ctx, prefixedKey, "lockOwner")
+			return pl, nil
 		}
-		var zero T
-		return zero, err
+		c.l2.HDel(ctx, prefixedKey, "lockOwner")
+		return nil, err
 	}
 
 	pl := payload.CachePayload[T]{Data: dbVal, IsNil: false}
 	c.setCacheAndUnlock(ctx, prefixedKey, pl, ttl)
-	return dbVal, nil
+	return pl, nil
 }
 
 func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload.CachePayload[T], ttl time.Duration) {
@@ -161,21 +194,21 @@ func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload
 		ttl -= time.Duration(c.rand.Int63n(int64(jitter)))
 	}
 
+	pl.ExpiresAt = time.Now().Add(ttl)
+
 	bytes, err := c.opts.Serializer.Marshal(pl)
 	if err != nil {
 		c.opts.Logger.Error("Failed to marshal data", "key", key, "error", err)
 		c.l2.HDel(ctx, key, "lockOwner")
 		return
 	}
-
 	err = c.setAndUnlockScript.Run(ctx, c.l2, []string{key}, c.ownerID, bytes, int(ttl.Seconds())).Err()
 	if err != nil {
 		c.opts.Logger.Error("Failed to run setAndUnlock script", "key", key, "error", err)
 	}
-	c.l1.SetWithTTL(key, pl, 1, c.opts.L1TTL)
+	c.l1.SetWithTTL(key, pl, 1, min(c.opts.L1TTL, ttl))
 }
 
-// *** IMPROVEMENT: Simplified and safer refresh logic ***
 func (c *Cache[T]) refresh(ctx context.Context, prefixedKey string, ttl time.Duration, fn func(ctx context.Context) (T, error)) {
 	c.sf.Do(prefixedKey+":refresh", func() (interface{}, error) {
 		c.opts.Logger.Debug("Background refresh started", "key", prefixedKey)

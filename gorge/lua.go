@@ -1,34 +1,51 @@
 package gorge
 
-// --- LUA SCRIPTS ---
-
-// tryLockAndGetScript: Try to get a value. If not present, try to acquire a distributed lock.
-// KEYS[1]: key
-// ARGV[1]: ownerID of the current instance
-// ARGV[2]: lock TTL (in seconds) // FIX: Unit is seconds
-// Returns: { value, status }
-// status can be: "HIT", "LOCKED_BY_OTHER", "ACQUIRED_LOCK"
-const tryLockAndGetScript = `
-local val = redis.call('HGET', KEYS[1], 'value')
-if val then
-    return {val, 'HIT'}
+const (
+	// tryLockAndGetScript tries to get a key. If the key does not exist, it tries to
+	// acquire a lock.
+	//
+	// KEYS[1]: The key to get or lock.
+	// ARGV[1]: The lock owner ID.
+	// ARGV[2]: The lock TTL in seconds.
+	//
+	// Returns:
+	// { value, "HIT" } if the key exists.
+	// { nil, "ACQUIRED_LOCK" } if the lock was acquired.
+	// { nil, "LOCKED_BY_OTHER" } if the key is locked by another owner.
+	tryLockAndGetScript = `
+local value = redis.call('HGET', KEYS[1], 'value')
+if value then
+    return {value, 'HIT'}
 end
+
 local lockOwner = redis.call('HGET', KEYS[1], 'lockOwner')
-if lockOwner and lockOwner ~= ARGV[1] then
+if not lockOwner then
+    redis.call('HSET', KEYS[1], 'lockOwner', ARGV[1])
+    redis.call('PEXPIRE', KEYS[1], ARGV[2] * 1000)
+    return {nil, 'ACQUIRED_LOCK'}
+end
+
+if lockOwner == ARGV[1] then
+    -- We already own the lock, just extend it
+    redis.call('PEXPIRE', KEYS[1], ARGV[2] * 1000)
+    return {nil, 'ACQUIRED_LOCK'}
+else
     return {nil, 'LOCKED_BY_OTHER'}
 end
-redis.call('HSET', KEYS[1], 'lockOwner', ARGV[1])
-redis.call('EXPIRE', KEYS[1], ARGV[2])
-return {nil, 'ACQUIRED_LOCK'}
 `
 
-// setDataAndUnlockScript: Set a new value and release the lock.
-// KEYS[1]: key
-// ARGV[1]: ownerID
-// ARGV[2]: serialized value
-// ARGV[3]: TTL of the key (in seconds)
-// Returns: 1 if successful, 0 if not the lock owner
-const setDataAndUnlockScript = `
+	// setDataAndUnlockScript sets the value for a key and releases the lock if
+	// this instance owns it.
+	//
+	// KEYS[1]: The key to set.
+	// ARGV[1]: The lock owner ID to check against.
+	// ARGV[2]: The value to set.
+	// ARGV[3]: The TTL for the key in seconds.
+	//
+	// Returns:
+	// 1 if the operation was successful.
+	// 0 if the lock was owned by someone else.
+	setDataAndUnlockScript = `
 if redis.call('HGET', KEYS[1], 'lockOwner') == ARGV[1] then
     redis.call('HSET', KEYS[1], 'value', ARGV[2])
     redis.call('HDEL', KEYS[1], 'lockOwner')
@@ -37,3 +54,4 @@ if redis.call('HGET', KEYS[1], 'lockOwner') == ARGV[1] then
 end
 return 0
 `
+)
