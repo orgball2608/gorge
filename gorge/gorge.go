@@ -210,7 +210,7 @@ func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload
 }
 
 func (c *Cache[T]) refresh(ctx context.Context, prefixedKey string, ttl time.Duration, fn func(ctx context.Context) (T, error)) {
-	c.sf.Do(prefixedKey+":refresh", func() (interface{}, error) {
+	_, _, _ = c.sf.Do(prefixedKey+":refresh", func() (interface{}, error) {
 		c.opts.Logger.Debug("Background refresh started", "key", prefixedKey)
 		_, err := c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
 		if err != nil && !errors.Is(err, ErrNotFound) {

@@ -138,8 +138,10 @@ func TestGorge_Fetch_ThunderingHerd(t *testing.T) {
 	defer g.Close()
 
 	// Clear key to ensure a miss
-	g.Delete(ctx, key)
-	rdb.Del(ctx, g.prefixedKey(key))
+	err = g.Delete(ctx, key)
+	assert.NoError(t, err)
+	_, err = rdb.Del(ctx, g.prefixedKey(key)).Result()
+	assert.NoError(t, err)
 
 	var wg sync.WaitGroup
 	numGoroutines := 20
@@ -305,13 +307,16 @@ func BenchmarkFetch_L1Hit(b *testing.B) {
 	fn := func(ctx context.Context) (string, error) { return value, nil }
 
 	// Prime the cache
-	g.Fetch(ctx, key, 1*time.Hour, fn)
+	_, err := g.Fetch(ctx, key, 1*time.Hour, fn)
+	if err != nil {
+		b.Fatalf("failed to prime cache: %v", err)
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		g.Fetch(ctx, key, 1*time.Hour, fn)
+		_, _ = g.Fetch(ctx, key, 1*time.Hour, fn)
 	}
 }
 
@@ -325,14 +330,17 @@ func BenchmarkFetch_L2Hit(b *testing.B) {
 	fn := func(ctx context.Context) (string, error) { return value, nil }
 
 	// Prime the L2 cache and clear L1
-	g.Fetch(ctx, key, 1*time.Hour, fn)
+	_, err := g.Fetch(ctx, key, 1*time.Hour, fn)
+	if err != nil {
+		b.Fatalf("failed to prime cache: %v", err)
+	}
 	g.l1.Clear()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		g.Fetch(ctx, key, 1*time.Hour, fn)
+		_, _ = g.Fetch(ctx, key, 1*time.Hour, fn)
 	}
 }
 
@@ -350,6 +358,6 @@ func BenchmarkFetch_DBHit(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		// Use a different key for each iteration to ensure a DB hit
-		g.Fetch(ctx, fmt.Sprintf("%s-%d", key, i), 1*time.Hour, fn)
+		_, _ = g.Fetch(ctx, fmt.Sprintf("%s-%d", key, i), 1*time.Hour, fn)
 	}
 }
