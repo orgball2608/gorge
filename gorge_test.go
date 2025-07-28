@@ -157,7 +157,7 @@ func TestGorge_Fetch_ThunderingHerd(t *testing.T) {
 	defer g2.Close()
 
 	// Clear key to ensure a miss
-	g1.Delete(ctx, key)
+	_ = g1.Delete(ctx, key)
 	// Allow pubsub to propagate deletion to g2
 	time.Sleep(50 * time.Millisecond)
 
