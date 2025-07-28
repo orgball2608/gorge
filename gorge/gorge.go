@@ -116,6 +116,7 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 				c.opts.Logger.Debug("L2 cache hit", "key", prefixedKey)
 				return c.handleL2Hit(ctx, prefixedKey, value.(string), ttl, fn)
 			case "ACQUIRED_LOCK":
+				c.opts.Metrics.IncL2Misses()
 				c.opts.Logger.Debug("Acquired distributed lock", "key", prefixedKey, "owner", c.ownerID)
 				return c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
 			case "LOCKED_BY_OTHER":
@@ -146,6 +147,7 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 
 		if l1TTL > 0 {
 			c.l1.SetWithTTL(prefixedKey, pl, 1, l1TTL)
+			c.l1.Wait()
 		}
 	}
 
@@ -165,6 +167,7 @@ func (c *Cache[T]) handleL2Hit(ctx context.Context, prefixedKey, l2Val string, t
 	remainingTTL := time.Until(pl.ExpiresAt)
 	if remainingTTL > 0 {
 		c.l1.SetWithTTL(prefixedKey, pl, 1, min(c.opts.L1TTL, remainingTTL))
+		c.l1.Wait()
 	}
 
 	if c.opts.EnableStaleWhileRevalidate && pl.IsStale(c.opts.StaleTTL) {
@@ -219,6 +222,7 @@ func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload
 		return err
 	}
 	c.l1.SetWithTTL(key, pl, 1, min(c.opts.L1TTL, ttl))
+	c.l1.Wait()
 	return nil
 }
 

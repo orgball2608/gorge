@@ -3,8 +3,8 @@ package gorge
 import (
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/orgball2608/gorge/gorge/internal/payload"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestJSONSerializer(t *testing.T) {
@@ -12,7 +12,7 @@ func TestJSONSerializer(t *testing.T) {
 
 	t.Run("marshal and unmarshal successfully", func(t *testing.T) {
 		p := &payload.CachePayload[string]{
-			Data:      "hello world",
+			Data: "hello world",
 		}
 
 		data, err := s.Marshal(p)
@@ -28,7 +28,7 @@ func TestJSONSerializer(t *testing.T) {
 
 	t.Run("marshal and unmarshal with nil value", func(t *testing.T) {
 		p := &payload.CachePayload[string]{
-			IsNil:      true,
+			IsNil: true,
 		}
 
 		data, err := s.Marshal(p)
@@ -48,4 +48,3 @@ func TestJSONSerializer(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
-

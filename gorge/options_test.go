@@ -18,6 +18,15 @@ func TestOptions(t *testing.T) {
 		assert.IsType(t, JSONSerializer{}, opts.Serializer)
 		assert.NotNil(t, opts.Logger)
 		assert.IsType(t, &noOpMetrics{}, opts.Metrics)
+
+		// Call methods to improve coverage
+		opts.Metrics.IncL1Hits()
+		opts.Metrics.IncL1Misses()
+		opts.Metrics.IncL2Hits()
+		opts.Metrics.IncL2Misses()
+		opts.Metrics.IncDBFetches()
+		opts.Metrics.IncDBErrors()
+
 		assert.False(t, opts.EnableStaleWhileRevalidate)
 		assert.Equal(t, 1*time.Minute, opts.StaleTTL)
 		assert.Equal(t, 1*time.Minute, opts.NegativeCacheTTL)

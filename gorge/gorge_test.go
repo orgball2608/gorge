@@ -440,6 +440,58 @@ func TestSetCache_MarshalError(t *testing.T) {
 	assert.Empty(t, lockOwner, "Lock should be released on marshal error")
 }
 
+func TestGorge_DisabledCaches(t *testing.T) {
+	ctx := context.Background()
+	key := "disabled-key"
+	value := "disabled-value"
+	ns := "test-disabled"
+
+	var fnCalls int32
+	fn := func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&fnCalls, 1)
+		return value, nil
+	}
+
+	t.Run("CacheReadDisabled", func(t *testing.T) {
+		atomic.StoreInt32(&fnCalls, 0)
+		g, err := New[string](rdb, WithNamespace(ns), WithCacheReadDisabled(true))
+		assert.NoError(t, err)
+		defer g.Close()
+
+		// Fetch twice, DB func should be called twice
+		_, err = g.Fetch(ctx, key, time.Hour, fn)
+		assert.NoError(t, err)
+		_, err = g.Fetch(ctx, key, time.Hour, fn)
+		assert.NoError(t, err)
+		assert.Equal(t, int32(2), atomic.LoadInt32(&fnCalls))
+
+		// Verify the key does not exist in L2
+		exists, err := rdb.Exists(ctx, g.prefixedKey(key)).Result()
+		assert.NoError(t, err)
+		assert.Equal(t, int64(0), exists, "Key should not be in L2 when cache read is disabled")
+	})
+
+	t.Run("CacheDeleteDisabled", func(t *testing.T) {
+		atomic.StoreInt32(&fnCalls, 0)
+		g, err := New[string](rdb, WithNamespace(ns), WithCacheDeleteDisabled(true))
+		assert.NoError(t, err)
+		defer g.Close()
+
+		// Prime the cache
+		_, err = g.Fetch(ctx, key, time.Hour, fn)
+		assert.NoError(t, err)
+
+		// Delete should be a no-op
+		err = g.Delete(ctx, key)
+		assert.NoError(t, err)
+
+		// Verify the key still exists in L2
+		exists, err := rdb.Exists(ctx, g.prefixedKey(key)).Result()
+		assert.NoError(t, err)
+		assert.Equal(t, int64(1), exists, "Key should not be deleted from L2 when delete is disabled")
+	})
+}
+
 func BenchmarkFetch_L1Hit(b *testing.B) {
 	ctx := context.Background()
 	g, _ := New[string](rdb, WithNamespace("bench-l1-hit"))
