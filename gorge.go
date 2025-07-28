@@ -31,8 +31,9 @@ type Cache[T any] struct {
 	ownerID        string
 	circuitBreaker *gobreaker.CircuitBreaker
 
-	lockAndGetScript   *redis.Script
-	setAndUnlockScript *redis.Script
+	lockAndGetScript       *redis.Script
+	setAndUnlockScript     *redis.Script
+	invalidateByTagsScript *redis.Script
 }
 
 func New[T any](redisClient redis.UniversalClient, opts ...Option) (*Cache[T], error) {
@@ -64,20 +65,21 @@ func New[T any](redisClient redis.UniversalClient, opts ...Option) (*Cache[T], e
 	}
 
 	c := &Cache[T]{
-		opts:               options,
-		l1:                 l1Cache,
-		l2:                 redisClient,
-		ctx:                ctx,
-		cancel:             cancel,
-		rand:               rand.New(rand.NewSource(time.Now().UnixNano())),
-		ownerID:            uuid.NewString(),
-		circuitBreaker:     cb,
-		lockAndGetScript:   redis.NewScript(tryLockAndGetScript),
-		setAndUnlockScript: redis.NewScript(setDataAndUnlockScript),
+		opts:                   options,
+		l1:                     l1Cache,
+		l2:                     redisClient,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		rand:                   rand.New(rand.NewSource(time.Now().UnixNano())),
+		ownerID:                uuid.NewString(),
+		circuitBreaker:         cb,
+		lockAndGetScript:       redis.NewScript(tryLockAndGetScript),
+		setAndUnlockScript:     redis.NewScript(setDataAndUnlockScript),
+		invalidateByTagsScript: redis.NewScript(invalidateByTagsScript),
 	}
 
 	// Pre-load Lua scripts into Redis.
-	for _, script := range []*redis.Script{c.lockAndGetScript, c.setAndUnlockScript} {
+	for _, script := range []*redis.Script{c.lockAndGetScript, c.setAndUnlockScript, c.invalidateByTagsScript} {
 		if err := script.Load(ctx, redisClient).Err(); err != nil {
 			return nil, fmt.Errorf("failed to load lua script: %w", err)
 		}
@@ -384,59 +386,50 @@ func (c *Cache[T]) InvalidateTags(ctx context.Context, tags ...string) error {
 
 	c.opts.Logger.Info("Invalidating tags", "tags", tags)
 
-	keysToDelete := make(map[string]struct{})
 	tagKeys := make([]string, len(tags))
-
 	for i, tag := range tags {
-		tagKey := c.tagKey(tag)
-		tagKeys[i] = tagKey
+		tagKeys[i] = c.tagKey(tag)
+	}
 
+	// We still need to get the members for L1 invalidation on other nodes.
+	// This is a trade-off for correctness. The Lua script handles the atomic deletion on L2.
+	keysToInvalidateLocally := make(map[string]struct{})
+	for _, tagKey := range tagKeys {
 		members, err := c.l2.SMembers(ctx, tagKey).Result()
 		if err != nil {
-			c.opts.Logger.Error("Failed to get members for tag", "tag", tag, "error", err)
-			continue // Continue to next tag
+			c.opts.Logger.Error("Failed to get members for tag for local invalidation", "tagKey", tagKey, "error", err)
+			// Continue anyway, the Lua script will still clear L2.
 		}
 		for _, member := range members {
-			keysToDelete[member] = struct{}{}
+			keysToInvalidateLocally[member] = struct{}{}
 		}
 	}
 
-	if len(keysToDelete) == 0 {
-		return nil
-	}
-
-	// Convert map keys to slice
-	keySlice := make([]string, 0, len(keysToDelete))
-	for k := range keysToDelete {
-		keySlice = append(keySlice, k)
-	}
-
-	// Use a pipeline to delete all keys and tag sets
+	// Execute the Lua script to delete all keys on Redis side.
 	_, err := c.executeL2(func() (interface{}, error) {
-		pipe := c.l2.Pipeline()
-		pipe.Del(ctx, keySlice...)
-		pipe.Del(ctx, tagKeys...)
-
-		// Publish invalidation for each key
-		for _, key := range keySlice {
-			pipe.Publish(ctx, c.opts.InvalidationChannel, key)
-		}
-
-		_, err := pipe.Exec(ctx)
-		return nil, err
+		return c.invalidateByTagsScript.Run(ctx, c.l2, tagKeys).Result()
 	})
 
 	if err != nil {
-		c.opts.Logger.Error("Failed to execute invalidation pipeline", "error", err)
-		return err
+		c.opts.Logger.Error("Failed to execute invalidateByTagsScript", "error", err)
+		// Don't return yet, still attempt to publish invalidations.
 	}
 
-	// Invalidate L1 cache locally
-	for _, key := range keySlice {
-		c.l1.Del(key)
+	// Publish invalidation messages for all affected keys.
+	// This is crucial for other nodes to invalidate their L1 caches.
+	if len(keysToInvalidateLocally) > 0 {
+		pipe := c.l2.Pipeline()
+		for key := range keysToInvalidateLocally {
+			c.l1.Del(key) // Invalidate local L1 cache immediately.
+			pipe.Publish(ctx, c.opts.InvalidationChannel, key)
+		}
+		if _, pubErr := pipe.Exec(ctx); pubErr != nil {
+			c.opts.Logger.Error("Failed to publish invalidation messages for tags", "error", pubErr)
+			return errors.Join(err, pubErr) // Join script error and pubsub error.
+		}
 	}
 
-	return nil
+	return err
 }
 
 func (c *Cache[T]) Close() {

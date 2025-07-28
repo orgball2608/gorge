@@ -56,4 +56,33 @@ if redis.call('HGET', KEYS[1], 'lockOwner') == ARGV[1] then
 end
 return 0
 `
+
+	// invalidateByTagsScript deletes all keys associated with the given tags,
+	// as well as the tag sets themselves. This is more efficient than fetching
+	// all members to the client and then deleting them.
+	//
+	// KEYS: A list of tag keys (e.g., namespace:tag:tag1, namespace:tag:tag2, ...)
+	//
+	// Returns:
+	// The total number of keys deleted (cache keys + tag keys).
+	invalidateByTagsScript = `
+local members = {}
+for i, tag_key in ipairs(KEYS) do
+    local current_members = redis.call('SMEMBERS', tag_key)
+    for j, member in ipairs(current_members) do
+        table.insert(members, member)
+    end
+end
+
+if #members == 0 and #KEYS == 0 then
+    return 0
+end
+
+-- Add the tag keys themselves to the list of keys to be deleted.
+for i, tag_key in ipairs(KEYS) do
+    table.insert(members, tag_key)
+end
+
+return redis.call('DEL', unpack(members))
+`
 )

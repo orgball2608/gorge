@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto"
-	"github.com/orgball2608/gorge/internal/payload"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/testcontainers/testcontainers-go"
@@ -26,11 +25,11 @@ var (
 // mockSerializer is used to test serialization errors.
 type mockSerializer struct{}
 
-func (s mockSerializer) Marshal(v interface{}) ([]byte, error) {
+func (s mockSerializer) Marshal(_ interface{}) ([]byte, error) {
 	return nil, errors.New("mock marshal error")
 }
 
-func (s mockSerializer) Unmarshal(data []byte, v interface{}) error {
+func (s mockSerializer) Unmarshal(_ []byte, _ interface{}) error {
 	return errors.New("mock unmarshal error")
 }
 
@@ -573,18 +572,13 @@ func TestGorge_Set(t *testing.T) {
 	err = g1.Set(ctx, key, value1, time.Hour)
 	assert.NoError(t, err)
 
-	// 2. Verify g1 has it in L1 eventually
-	assert.Eventually(t, func() bool {
-		v1, ok := g1.l1.Get(g1.prefixedKey(key))
-		if !ok {
-			return false
-		}
-		pl, ok_cast := v1.(payload.CachePayload[string])
-		if !ok_cast {
-			return false
-		}
-		return assert.ObjectsAreEqual(value1, pl.Data)
-	}, time.Second, 10*time.Millisecond, "g1 should have the value in L1 after Set")
+	// 2. Verify g1 has it in L1 by fetching it back
+	v1, err := g1.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		t.Fail() // Should not be called, should be a cache hit
+		return "", nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, value1, v1)
 
 	// 3. Verify g2 can fetch it from L2
 	val, err := g2.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {

@@ -187,7 +187,7 @@ import (
     "github.com/orgball2608/gorge"
 )
 
-type myMetrics {
+type myMetrics struct {
 	// ... counters
 }
 
@@ -219,11 +219,82 @@ Benchmarks were run on an Apple M1 (goos: darwin, goarch: arm64).
 
 | Benchmark              | Description                               | Result (ns/op) | Allocations (B/op) | Allocations (allocs/op) |
 | ---------------------- | ----------------------------------------- | -------------- | ------------------ | ----------------------- |
-| `BenchmarkFetch_L1Hit` | Fetches data from the L1 (in-memory) cache| `~280 ns/op`   | `95 B/op`          | `5 allocs/op`           |
-| `BenchmarkFetch_L2Hit` | Fetches data from the L2 (Redis) cache    | `~824 µs/op`   | `2281 B/op`        | `43 allocs/op`          |
-| `BenchmarkFetch_DBHit` | Fetches data from the source (cache miss) | `~801 µs/op`   | `2011 B/op`        | `55 allocs/op`          |
+| `BenchmarkFetch_L1Hit` | Fetches data from the L1 (in-memory) cache| `~249 ns/op`   | `95 B/op`          | `5 allocs/op`           |
+| `BenchmarkFetch_L2Hit` | Fetches data from the L2 (Redis) cache    | `~862 µs/op`   | `2287 B/op`        | `43 allocs/op`          |
+| `BenchmarkFetch_DBHit` | Fetches data from the source (cache miss) | `~866 µs/op`   | `2036 B/op`        | `55 allocs/op`          |
 
 *Note: Actual results will vary depending on your environment and network latency.*
+
+## 📝 Best Practices & Recipes
+
+### Choosing a `LockTTL`
+The `WithLockTTL` option is critical for preventing race conditions. The distributed lock ensures that only one application instance can regenerate an expired key at a time.
+
+**Rule of thumb**: The lock TTL should be longer than the slowest possible execution time of your `fn` function.
+- If `fn` times out after 5 seconds, a `LockTTL` of `10 * time.Second` (the default) is a safe choice.
+- If the lock expires before `fn` completes, another instance might acquire the lock and start a redundant fetch, partially defeating the thundering herd protection.
+
+### Configuring the Circuit Breaker
+The circuit breaker (`WithEnableCircuitBreaker(true)`) protects your application from a failing or slow Redis instance.
+- `CircuitBreakerMaxFailures`: The number of consecutive Redis failures before the breaker "opens". A value of `5` is a reasonable starting point.
+- `CircuitBreakerTimeout`: The time the breaker stays open before transitioning to "half-open". A value of `30 * time.Second` can give Redis time to recover.
+
+When the breaker is open, `gorge` will bypass the L2 cache and call your `fn` directly, ensuring your application remains available, albeit with higher latency.
+
+### Integrating with Prometheus
+Here is a conceptual example of how to implement the `Metrics` interface using `prometheus/client_golang`.
+
+```go
+import (
+    "github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+type PrometheusMetrics struct {
+    l1Hits      prometheus.Counter
+    l1Misses    prometheus.Counter
+    l2Hits      prometheus.Counter
+    l2Misses    prometheus.Counter
+    dbFetches   prometheus.Counter
+    dbErrors    prometheus.Counter
+    dbLatency   prometheus.Histogram
+    l2Latency   prometheus.Histogram
+}
+
+func NewPrometheusMetrics(namespace, subsystem string) *PrometheusMetrics {
+    return &PrometheusMetrics{
+        l1Hits: promauto.NewCounter(prometheus.CounterOpts{
+            Namespace: namespace, Subsystem: subsystem, Name: "l1_hits_total",
+        }),
+        l1Misses: promauto.NewCounter(prometheus.CounterOpts{
+            Namespace: namespace, Subsystem: subsystem, Name: "l1_misses_total",
+        }),
+        // ... other counters ...
+        dbLatency: promauto.NewHistogram(prometheus.HistogramOpts{
+            Namespace: namespace, Subsystem: subsystem, Name: "db_fetch_latency_seconds",
+            Buckets:   prometheus.DefBuckets, // or custom buckets
+        }),
+        l2Latency: promauto.NewHistogram(prometheus.HistogramOpts{
+            Namespace: namespace, Subsystem: subsystem, Name: "l2_hit_latency_seconds",
+            Buckets:   []float64{0.001, 0.005, 0.01}, // Custom buckets for small latencies
+        }),
+    }
+}
+
+func (p *PrometheusMetrics) IncL1Hits()    { p.l1Hits.Inc() }
+// ... implement other counter increments ...
+
+func (p *PrometheusMetrics) ObserveDBFetchLatency(d time.Duration) {
+    p.dbLatency.Observe(d.Seconds())
+}
+func (p *PrometheusMetrics) ObserveL2HitLatency(d time.Duration) {
+    p.l2Latency.Observe(d.Seconds())
+}
+
+// In your setup:
+// metrics := NewPrometheusMetrics("myapp", "cache")
+// cache, err := gorge.New[User](redisClient, gorge.WithMetrics(metrics))
+```
 
 ## ❤️ Contributing
 
