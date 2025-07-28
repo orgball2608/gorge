@@ -139,10 +139,20 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 			})
 
 			if err != nil {
-				// If circuit breaker is open, go directly to DB
+				// If circuit breaker is open, go directly to DB and bypass cache writes.
 				if errors.Is(err, gobreaker.ErrOpenState) || errors.Is(err, gobreaker.ErrTooManyRequests) {
 					c.opts.Logger.Warn("Circuit breaker is open. Fetching directly from DB.", "key", prefixedKey, "error", err)
-					return c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
+					c.opts.Metrics.IncDBFetches()
+					start := time.Now()
+					dbVal, dbErr := fn(ctx)
+					c.opts.Metrics.ObserveDBFetchLatency(time.Since(start))
+					if dbErr != nil {
+						c.opts.Metrics.IncDBErrors()
+						return nil, dbErr
+					}
+					// Return the value directly without trying to cache it.
+					pl := payload.CachePayload[T]{Data: dbVal, IsNil: false}
+					return pl, nil
 				}
 				// For other Redis errors, log and return
 				c.opts.Logger.Error("Failed to run lockAndGet script", "key", prefixedKey, "error", err)

@@ -121,3 +121,19 @@ func TestGorge_Metrics(t *testing.T) {
 	assert.Len(t, dbfl, 2, "4: DB Fetch Latencies count should increase")
 	assert.Greater(t, dbfl[1], time.Duration(0), "4: DB Error Latency > 0")
 }
+
+func TestNoOpMetrics(t *testing.T) {
+	// This test is just to ensure 100% coverage on the no-op metrics.
+	// It calls all the methods to ensure they don't panic.
+	m := &noOpMetrics{}
+	assert.NotPanics(t, func() {
+		m.IncL1Hits()
+		m.IncL1Misses()
+		m.IncL2Hits()
+		m.IncL2Misses()
+		m.IncDBFetches()
+		m.IncDBErrors()
+		m.ObserveDBFetchLatency(time.Second)
+		m.ObserveL2HitLatency(time.Second)
+	})
+}

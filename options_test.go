@@ -61,6 +61,28 @@ func TestOptions(t *testing.T) {
 	})
 }
 
+func TestWithExpirationJitter(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    float64
+		expected float64
+	}{
+		{"NormalJitter", 0.1, 0.1},
+		{"ZeroJitter", 0.0, 0.0},
+		{"MaxJitter", 1.0, 1.0},
+		{"NegativeJitter", -0.5, 0.0},
+		{"LargeJitter", 1.5, 1.0},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewDefaultOptions()
+			WithExpirationJitter(tc.input)(opts)
+			assert.Equal(t, tc.expected, opts.ExpirationJitter)
+		})
+	}
+}
+
 func TestOptions_validate(t *testing.T) {
 	t.Run("valid options", func(t *testing.T) {
 		opts := NewDefaultOptions()
@@ -106,6 +128,36 @@ func TestOptions_validate(t *testing.T) {
 				name:    "Invalid CircuitBreakerMaxFailures",
 				optFunc: func(o *Options) { o.EnableCircuitBreaker = true; o.CircuitBreakerMaxFailures = 0 },
 				errMsg:  "CircuitBreakerMaxFailures must be positive",
+			},
+			{
+				name:    "Invalid CircuitBreakerTimeout",
+				optFunc: func(o *Options) { o.EnableCircuitBreaker = true; o.CircuitBreakerTimeout = 0 },
+				errMsg:  "CircuitBreakerTimeout must be positive",
+			},
+			{
+				name:    "Invalid NegativeCacheTTL",
+				optFunc: func(o *Options) { o.NegativeCacheTTL = 0 },
+				errMsg:  "NegativeCacheTTL must be positive",
+			},
+			{
+				name:    "Invalid StaleTTL",
+				optFunc: func(o *Options) { o.StaleTTL = 0 },
+				errMsg:  "StaleTTL must be positive",
+			},
+			{
+				name:    "Invalid LockSleep",
+				optFunc: func(o *Options) { o.LockSleep = 0 },
+				errMsg:  "LockSleep must be positive",
+			},
+			{
+				name:    "Invalid LockRetries",
+				optFunc: func(o *Options) { o.LockRetries = -1 },
+				errMsg:  "LockRetries must be non-negative",
+			},
+			{
+				name:    "Jitter > 1",
+				optFunc: func(o *Options) { o.ExpirationJitter = 1.1 },
+				errMsg:  "ExpirationJitter must be between 0.0 and 1.0",
 			},
 		}
 

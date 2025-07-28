@@ -135,6 +135,7 @@ func TestGorge_Fetch_NegativeCaching(t *testing.T) {
 
 func TestGorge_Fetch_ThunderingHerd(t *testing.T) {
 	ctx := context.Background()
+	ns := "test-herd"
 	key := "herd-key"
 	value := "herd-value"
 
@@ -146,135 +147,51 @@ func TestGorge_Fetch_ThunderingHerd(t *testing.T) {
 		return value, nil
 	}
 
-	g, err := New[string](rdb, WithNamespace("test-prefix"))
+	// Create two instances to simulate two different processes
+	g1, err := New[string](rdb, WithNamespace(ns))
 	assert.NoError(t, err)
-	defer g.Close()
+	defer g1.Close()
+
+	g2, err := New[string](rdb, WithNamespace(ns))
+	assert.NoError(t, err)
+	defer g2.Close()
 
 	// Clear key to ensure a miss
-	err = g.Delete(ctx, key)
-	assert.NoError(t, err)
-	_, err = rdb.Del(ctx, g.prefixedKey(key)).Result()
-	assert.NoError(t, err)
+	g1.Delete(ctx, key)
+	// Allow pubsub to propagate deletion to g2
+	time.Sleep(50 * time.Millisecond)
 
 	var wg sync.WaitGroup
 	numGoroutines := 20
 
+	// Both g1 and g2 will race to fetch the same key
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			v, err := g.Fetch(ctx, key, 1*time.Hour, fn)
+			var v string
+			var err error
+			// Half the goroutines use g1, half use g2
+			if i%2 == 0 {
+				v, err = g1.Fetch(ctx, key, 1*time.Hour, fn)
+			} else {
+				v, err = g2.Fetch(ctx, key, 1*time.Hour, fn)
+			}
 			assert.NoError(t, err)
 			assert.Equal(t, value, v)
-		}()
+		}(i)
 	}
 
 	wg.Wait()
 
 	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls), "fn should only be called once during a thundering herd")
-}
 
-func TestGorge_Fetch_Singleflight_L1Race(t *testing.T) {
-	ctx := context.Background()
-	key := "herd-l1-race-key"
-	value := "herd-l1-race-value"
+	// Verify both instances have the value in their local L1 cache
+	_, ok := g1.l1.Get(g1.prefixedKey(key))
+	assert.True(t, ok, "g1 (leader or follower) should have the key in its L1 cache")
 
-	var fnCalls int32
-	// This channel will block the first goroutine inside the singleflight function
-	blocker := make(chan struct{})
-	// This channel signals that the L1 cache has been populated by the test's main goroutine
-	l1Populated := make(chan struct{})
-
-	fn := func(ctx context.Context) (string, error) {
-		atomic.AddInt32(&fnCalls, 1)
-		// The first goroutine to enter will block here
-		<-blocker
-		return value, nil
-	}
-
-	g, err := New[string](rdb, WithNamespace("test-l1-race"))
-	assert.NoError(t, err)
-	defer g.Close()
-
-	// Clear key to ensure a miss
-	_ = g.Delete(ctx, key)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// Start the first goroutine, which will enter the singleflight func and block
-	go func() {
-		defer wg.Done()
-		// This call will populate L1 via the sf.Do function body
-		_, _ = g.Fetch(ctx, key, time.Hour, fn)
-	}()
-
-	// Give the goroutine time to enter the singleflight function
-	time.Sleep(50 * time.Millisecond)
-
-	// Now, manually populate the L1 cache, simulating a race where another
-	// process or thread completes the work and populates L1.
-	// This is the path we want to test: `if val, found := c.l1.Get(prefixedKey); found`
-	// inside the singleflight.Do().
-	// To do this, we need a second goroutine that *also* calls fetch.
-	// Let's adjust the test.
-
-	// --- Resetting the test logic ---
-	atomic.StoreInt32(&fnCalls, 0)
-	_ = g.Delete(ctx, key)
-	blocker = make(chan struct{})
-	fn = func(ctx context.Context) (string, error) {
-		atomic.AddInt32(&fnCalls, 1)
-		// The first goroutine blocks, the others wait on the singleflight.
-		// When this returns, the followers will re-check L1.
-		close(l1Populated) // Signal that the "work" is done
-		time.Sleep(50 * time.Millisecond)
-		return value, nil
-	}
-
-	// The key is that the followers in sf.Do should check L1 again.
-	// The current ThunderingHerd test actually covers this implicitly.
-	// Let's make it explicit.
-
-	// We need two cache instances to test the L1 population for followers.
-	g1, _ := New[string](rdb, WithNamespace("test-l1-race-2"))
-	g2, _ := New[string](rdb, WithNamespace("test-l1-race-2"))
-	defer g1.Close()
-	defer g2.Close()
-
-	_ = g1.Delete(ctx, key)
-	fn = func(ctx context.Context) (string, error) {
-		atomic.AddInt32(&fnCalls, 1)
-		time.Sleep(100 * time.Millisecond)
-		return value, nil
-	}
-
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// g1 will do the fetch, g2 will be a follower
-			val, err := g1.Fetch(ctx, key, time.Hour, fn)
-			assert.NoError(t, err)
-			assert.Equal(t, value, val)
-		}()
-	}
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			val, err := g2.Fetch(ctx, key, time.Hour, fn)
-			assert.NoError(t, err)
-			assert.Equal(t, value, val)
-		}()
-	}
-
-	wg.Wait()
-	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls))
-
-	// Now, the crucial check. g2 was a "follower". Did it populate its L1 cache?
-	_, ok := g2.l1.Get(g2.prefixedKey(key))
-	assert.True(t, ok, "Follower instance g2 should have populated its L1 cache")
+	_, ok = g2.l1.Get(g2.prefixedKey(key))
+	assert.True(t, ok, "g2 (follower or leader) should have the key in its L1 cache")
 }
 
 func TestGorge_Fetch_StaleWhileRevalidate(t *testing.T) {
@@ -600,12 +517,22 @@ func TestGorge_RedisDown(t *testing.T) {
 	// Test Fetch failure
 	_, err = g.Fetch(ctx, "some-key", time.Hour, fn)
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to run lockAndGet script")
+	assert.Contains(t, err.Error(), "connection refused")
 
 	// Test Delete failure
 	err = g.Delete(ctx, "some-key")
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "connection refused") // Example error text
+	assert.Contains(t, err.Error(), "connection refused")
+
+	// Test Set failure
+	err = g.Set(ctx, "some-key", "some-value", time.Hour)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "connection refused")
+
+	// Test InvalidateTags failure
+	err = g.InvalidateTags(ctx, "some-tag")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "connection refused")
 }
 
 func TestDelete_Disabled(t *testing.T) {
