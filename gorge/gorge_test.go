@@ -2,6 +2,7 @@ package gorge
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -20,6 +21,17 @@ import (
 var (
 	rdb *redis.Client
 )
+
+// mockSerializer is used to test serialization errors.
+type mockSerializer struct{}
+
+func (s mockSerializer) Marshal(v interface{}) ([]byte, error) {
+	return nil, errors.New("mock marshal error")
+}
+
+func (s mockSerializer) Unmarshal(data []byte, v interface{}) error {
+	return errors.New("mock unmarshal error")
+}
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -177,7 +189,6 @@ func TestGorge_Fetch_StaleWhileRevalidate(t *testing.T) {
 		return secondValue, nil
 	}
 
-	// **SỬA LỖI: Logic test được làm rõ ràng và chính xác**
 	mainTTL := 5 * time.Second
 	staleTTL := 3 * time.Second // Key will be stale in its last 3 seconds of life
 
@@ -196,7 +207,6 @@ func TestGorge_Fetch_StaleWhileRevalidate(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls))
 
 	// 2. Wait until data is stale but not expired.
-	// Stale period starts at T+2s (5s - 3s). We wait 3s to be safely inside it.
 	time.Sleep(3 * time.Second)
 
 	// 3. Second call: should return stale value and trigger background refresh
@@ -227,7 +237,6 @@ func TestGorge_GracefulDegradation(t *testing.T) {
 		return value, nil
 	}
 
-	// Create a cache instance with cache reads disabled
 	g, err := New[string](rdb,
 		WithNamespace("test-degradation"),
 		WithCacheReadDisabled(true),
@@ -235,12 +244,10 @@ func TestGorge_GracefulDegradation(t *testing.T) {
 	assert.NoError(t, err)
 	defer g.Close()
 
-	// 1. First call, should go to DB
 	_, err = g.Fetch(ctx, key, time.Hour, fn)
 	assert.NoError(t, err)
 	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls))
 
-	// 2. Second call, should also go to DB because cache is disabled
 	_, err = g.Fetch(ctx, key, time.Hour, fn)
 	assert.NoError(t, err)
 	assert.Equal(t, int32(2), atomic.LoadInt32(&fnCalls), "fn should be called again as cache is disabled")
@@ -256,7 +263,6 @@ func TestGorge_Delete_PubSub(t *testing.T) {
 		return value, nil
 	}
 
-	// Create two gorge instances to simulate two different nodes
 	g1, err := New[string](rdb, WithNamespace(prefix))
 	assert.NoError(t, err)
 	defer g1.Close()
@@ -265,13 +271,11 @@ func TestGorge_Delete_PubSub(t *testing.T) {
 	assert.NoError(t, err)
 	defer g2.Close()
 
-	// 1. Populate cache on both nodes
 	_, err = g1.Fetch(ctx, key, 1*time.Hour, fn)
 	assert.NoError(t, err)
 	_, err = g2.Fetch(ctx, key, 1*time.Hour, fn)
 	assert.NoError(t, err)
 
-	// Verify L1 cache exists on both, accounting for eventual consistency
 	assert.Eventually(t, func() bool {
 		_, ok := g1.l1.Get(g1.prefixedKey(key))
 		return ok
@@ -281,17 +285,14 @@ func TestGorge_Delete_PubSub(t *testing.T) {
 		return ok
 	}, 100*time.Millisecond, 10*time.Millisecond, "g2 L1 cache should have the key")
 
-	// 2. g1 deletes the key
 	err = g1.Delete(ctx, key)
 	assert.NoError(t, err)
 
-	// 3. Verify L1 is deleted on g1 immediately (should be fast due to local call)
 	assert.Eventually(t, func() bool {
 		_, ok := g1.l1.Get(g1.prefixedKey(key))
 		return !ok
 	}, 100*time.Millisecond, 10*time.Millisecond, "g1 L1 cache should be deleted immediately")
 
-	// 4. Wait for pub/sub message to be processed by g2
 	assert.Eventually(t, func() bool {
 		_, ok := g2.l1.Get(g2.prefixedKey(key))
 		return !ok
@@ -299,9 +300,8 @@ func TestGorge_Delete_PubSub(t *testing.T) {
 }
 
 func TestNew_RistrettoError(t *testing.T) {
-	// Ristretto fails to create a cache if NumCounters is not positive.
 	badL1Config := &ristretto.Config{
-		NumCounters: 0, // Invalid config
+		NumCounters: 0,
 		MaxCost:     1 << 30,
 		BufferItems: 64,
 	}
@@ -324,25 +324,23 @@ func TestFetch_LockRetriesExhausted(t *testing.T) {
 		WithNamespace("test-lock-exhausted"),
 		WithLockRetries(2),
 		WithLockSleep(10*time.Millisecond),
+		WithLockTTL(1*time.Second), // Use WithLockTTL
 	)
 	assert.NoError(t, err)
 	defer g.Close()
 
-	// Manually acquire the lock with a different owner
 	prefixedKey := g.prefixedKey(key)
 	rdb.HSet(ctx, prefixedKey, "lockOwner", "another-owner")
 	rdb.Expire(ctx, prefixedKey, 10*time.Second)
 
-	// Fetch should now fail after retrying
 	_, err = g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
-		t.FailNow() // This function should never be called
+		t.FailNow()
 		return "", nil
 	})
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to acquire lock")
 
-	// Cleanup
 	rdb.Del(ctx, prefixedKey)
 }
 
@@ -355,9 +353,11 @@ func TestHandleL2Hit_UnmarshalError(t *testing.T) {
 	assert.NoError(t, err)
 	defer g.Close()
 
-	// Manually set a corrupted value in L2
+	// Manually set a value in L2 that is a valid payload, but whose data
+	// cannot be unmarshalled into the target type (string).
 	prefixedKey := g.prefixedKey(key)
-	rdb.HSet(ctx, prefixedKey, "value", "{not-a-valid-json")
+	badPayload, _ := JSONSerializer{}.Marshal(map[string]interface{}{"data": 12345, "expiresAt": time.Now().Add(time.Hour)})
+	rdb.HSet(ctx, prefixedKey, "value", badPayload)
 	rdb.Expire(ctx, prefixedKey, time.Hour)
 
 	// Fetch should fail to unmarshal, and then call the DB function
@@ -382,20 +382,62 @@ func TestDelete_Disabled(t *testing.T) {
 	assert.NoError(t, err)
 	defer g.Close()
 
-	// Set a value
 	_, err = g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
 		return "some-value", nil
 	})
 	assert.NoError(t, err)
 
-	// Attempt to delete
 	err = g.Delete(ctx, key)
 	assert.NoError(t, err)
 
-	// Verify the key still exists in L2
 	prefixedKey := g.prefixedKey(key)
 	res := rdb.Exists(ctx, prefixedKey).Val()
 	assert.Equal(t, int64(1), res, "Key should still exist in Redis after disabled delete call")
+}
+
+func TestFetch_DBError(t *testing.T) {
+	ctx := context.Background()
+	key := "db-error-key"
+	dbErr := errors.New("database connection failed")
+
+	g, err := New[string](rdb, WithNamespace("test-db-error"))
+	assert.NoError(t, err)
+	defer g.Close()
+
+	_, err = g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		return "", dbErr
+	})
+
+	assert.ErrorIs(t, err, dbErr)
+
+	// Check that the lock was released
+	prefixedKey := g.prefixedKey(key)
+	lockOwner := rdb.HGet(ctx, prefixedKey, "lockOwner").Val()
+	assert.Empty(t, lockOwner, "Lock should be released on DB error")
+}
+
+func TestSetCache_MarshalError(t *testing.T) {
+	ctx := context.Background()
+	key := "marshal-error-key"
+
+	g, err := New[string](rdb,
+		WithNamespace("test-marshal-error"),
+		WithSerializer(mockSerializer{}),
+	)
+	assert.NoError(t, err)
+	defer g.Close()
+
+	_, err = g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		return "some-data", nil
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "mock marshal error")
+
+	// Check that the lock was released
+	prefixedKey := g.prefixedKey(key)
+	lockOwner := rdb.HGet(ctx, prefixedKey, "lockOwner").Val()
+	assert.Empty(t, lockOwner, "Lock should be released on marshal error")
 }
 
 func BenchmarkFetch_L1Hit(b *testing.B) {
@@ -407,7 +449,6 @@ func BenchmarkFetch_L1Hit(b *testing.B) {
 	value := "my-value"
 	fn := func(ctx context.Context) (string, error) { return value, nil }
 
-	// Prime the cache
 	_, err := g.Fetch(ctx, key, 1*time.Hour, fn)
 	if err != nil {
 		b.Fatalf("failed to prime cache: %v", err)
@@ -430,7 +471,6 @@ func BenchmarkFetch_L2Hit(b *testing.B) {
 	value := "my-value"
 	fn := func(ctx context.Context) (string, error) { return value, nil }
 
-	// Prime the L2 cache and clear L1
 	_, err := g.Fetch(ctx, key, 1*time.Hour, fn)
 	if err != nil {
 		b.Fatalf("failed to prime cache: %v", err)
@@ -458,7 +498,6 @@ func BenchmarkFetch_DBHit(b *testing.B) {
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
-		// Use a different key for each iteration to ensure a DB hit
 		_, _ = g.Fetch(ctx, fmt.Sprintf("%s-%d", key, i), 1*time.Hour, fn)
 	}
 }
