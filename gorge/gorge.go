@@ -180,19 +180,24 @@ func (c *Cache[T]) fetchFromDBAndSet(ctx context.Context, prefixedKey string, tt
 		c.opts.Metrics.IncDBErrors()
 		if errors.Is(err, ErrNotFound) {
 			pl := payload.CachePayload[T]{IsNil: true}
-			c.setCacheAndUnlock(ctx, prefixedKey, pl, c.opts.NegativeCacheTTL)
+			if err := c.setCacheAndUnlock(ctx, prefixedKey, pl, c.opts.NegativeCacheTTL); err != nil {
+				return nil, fmt.Errorf("failed to set negative cache: %w", err)
+			}
 			return pl, nil
 		}
-		c.l2.HDel(ctx, prefixedKey, "lockOwner")
+		// Use c.ctx to ensure the lock is released even if the request context is cancelled.
+		c.l2.HDel(c.ctx, prefixedKey, "lockOwner")
 		return nil, err
 	}
 
 	pl := payload.CachePayload[T]{Data: dbVal, IsNil: false}
-	c.setCacheAndUnlock(ctx, prefixedKey, pl, ttl)
+	if err := c.setCacheAndUnlock(ctx, prefixedKey, pl, ttl); err != nil {
+		return nil, fmt.Errorf("failed to set cache after DB fetch: %w", err)
+	}
 	return pl, nil
 }
 
-func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload.CachePayload[T], ttl time.Duration) {
+func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload.CachePayload[T], ttl time.Duration) error {
 	if c.opts.ExpirationJitter > 0 {
 		jitter := time.Duration(c.opts.ExpirationJitter * float64(ttl))
 		ttl -= time.Duration(c.rand.Int63n(int64(jitter)))
@@ -202,15 +207,19 @@ func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload
 
 	bytes, err := c.opts.Serializer.Marshal(pl)
 	if err != nil {
-		c.opts.Logger.Error("Failed to marshal data", "key", key, "error", err)
-		c.l2.HDel(ctx, key, "lockOwner")
-		return
+		c.opts.Logger.Error("Failed to marshal data, releasing lock", "key", key, "error", err)
+		c.l2.HDel(c.ctx, key, "lockOwner")
+		return err
 	}
 	err = c.setAndUnlockScript.Run(ctx, c.l2, []string{key}, c.ownerID, bytes, int(ttl.Seconds())).Err()
 	if err != nil {
 		c.opts.Logger.Error("Failed to run setAndUnlock script", "key", key, "error", err)
+		// The lock will expire on its own based on TTL.
+		// Returning an error is crucial to signal the failure.
+		return err
 	}
 	c.l1.SetWithTTL(key, pl, 1, min(c.opts.L1TTL, ttl))
+	return nil
 }
 
 func (c *Cache[T]) refresh(prefixedKey string, ttl time.Duration, fn func(ctx context.Context) (T, error)) {

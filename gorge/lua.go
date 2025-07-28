@@ -10,28 +10,30 @@ const (
 	//
 	// Returns:
 	// { value, "HIT" } if the key exists.
-	// { nil, "ACQUIRED_LOCK" } if the lock was acquired.
-	// { nil, "LOCKED_BY_OTHER" } if the key is locked by another owner.
+	// { "", "ACQUIRED_LOCK" } if the lock was acquired.
+	// { "", "LOCKED_BY_OTHER" } if the key is locked by another owner.
 	tryLockAndGetScript = `
+local lockOwner = redis.call('HGET', KEYS[1], 'lockOwner')
+if lockOwner then
+    if lockOwner == ARGV[1] then
+        -- We already own the lock, just extend it
+        redis.call('PEXPIRE', KEYS[1], ARGV[2] * 1000)
+        return {'', 'ACQUIRED_LOCK'}
+    else
+        return {'', 'LOCKED_BY_OTHER'}
+    end
+end
+
+-- No lock exists, check for data
 local value = redis.call('HGET', KEYS[1], 'value')
 if value then
     return {value, 'HIT'}
 end
 
-local lockOwner = redis.call('HGET', KEYS[1], 'lockOwner')
-if not lockOwner then
-    redis.call('HSET', KEYS[1], 'lockOwner', ARGV[1])
-    redis.call('PEXPIRE', KEYS[1], ARGV[2] * 1000)
-    return {nil, 'ACQUIRED_LOCK'}
-end
-
-if lockOwner == ARGV[1] then
-    -- We already own the lock, just extend it
-    redis.call('PEXPIRE', KEYS[1], ARGV[2] * 1000)
-    return {nil, 'ACQUIRED_LOCK'}
-else
-    return {nil, 'LOCKED_BY_OTHER'}
-end
+-- No lock and no data, acquire lock
+redis.call('HSET', KEYS[1], 'lockOwner', ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[2] * 1000)
+return {'', 'ACQUIRED_LOCK'}
 `
 
 	// setDataAndUnlockScript sets the value for a key and releases the lock if
