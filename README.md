@@ -193,9 +193,9 @@ Benchmarks were run on a local M1 Mac. To run them yourself, use the command `go
 
 | Benchmark          | Description                               | Result (ns/op) |
 | ------------------ | ----------------------------------------- | -------------- |
-| `BenchmarkFetch_L1Hit` | Fetches data from the L1 (in-memory) cache | `253.5 ns/op`  |
-| `BenchmarkFetch_L2Hit` | Fetches data from the L2 (Redis) cache     | `224.1 ns/op`  |
-| `BenchmarkFetch_DBHit` | Fetches data from the source (cache miss)  | `918409 ns/op` |
+| `BenchmarkFetch_L1Hit` | Fetches data from the L1 (in-memory) cache | `218.8 ns/op`  |
+| `BenchmarkFetch_L2Hit` | Fetches data from the L2 (Redis) cache     | `780841 ns/op` |
+| `BenchmarkFetch_DBHit` | Fetches data from the source (cache miss)  | `822444 ns/op` |
 
 *Note: Actual results will vary depending on your environment and network latency.*
 

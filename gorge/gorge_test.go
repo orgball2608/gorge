@@ -523,16 +523,22 @@ func BenchmarkFetch_L2Hit(b *testing.B) {
 	value := "my-value"
 	fn := func(ctx context.Context) (string, error) { return value, nil }
 
+	// Prime the L2 cache (L1 will also be primed)
 	_, err := g.Fetch(ctx, key, 1*time.Hour, fn)
 	if err != nil {
 		b.Fatalf("failed to prime cache: %v", err)
 	}
-	g.l1.Clear()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
 	for i := 0; i < b.N; i++ {
+		// Stop the timer, perform setup for each iteration
+		b.StopTimer()
+		g.l1.Clear() // Clear L1 to ensure L2 is hit
+		b.StartTimer()
+
+		// Measure exactly one L2 hit
 		_, _ = g.Fetch(ctx, key, 1*time.Hour, fn)
 	}
 }
