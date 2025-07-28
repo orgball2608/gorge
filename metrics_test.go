@@ -80,7 +80,7 @@ func TestGorge_Metrics(t *testing.T) {
 	// 2. L1 hit
 	_, err = g.Fetch(ctx, key, time.Hour, fn)
 	assert.NoError(t, err)
-	l1h, l1m, l2h, l2m, dbf, dbe, dbfl, l2hl = m.get()
+	l1h, l1m, l2h, l2m, dbf, dbe, dbfl, _ = m.get()
 	assert.Equal(t, 1, l1h, "2: L1 Hits")
 	assert.Equal(t, 1, l1m, "2: L1 Misses")
 	assert.Equal(t, 0, l2h, "2: L2 Hits")
@@ -93,7 +93,7 @@ func TestGorge_Metrics(t *testing.T) {
 	g.l1.Clear()
 	_, err = g.Fetch(ctx, key, time.Hour, fn)
 	assert.NoError(t, err)
-	l1h, l1m, l2h, l2m, dbf, dbe, dbfl, l2hl = m.get()
+	l1h, l1m, l2h, l2m, dbf, dbe, _, l2hl = m.get()
 	assert.Equal(t, 1, l1h, "3: L1 Hits")
 	assert.Equal(t, 2, l1m, "3: L1 Misses")
 	assert.Equal(t, 1, l2h, "3: L2 Hits")
@@ -111,7 +111,7 @@ func TestGorge_Metrics(t *testing.T) {
 		return "", assert.AnError
 	})
 	assert.Error(t, err)
-	l1h, l1m, l2h, l2m, dbf, dbe, dbfl, l2hl = m.get()
+	l1h, l1m, l2h, l2m, dbf, dbe, dbfl, _ = m.get()
 	assert.Equal(t, 1, l1h, "4: L1 Hits")
 	assert.Equal(t, 3, l1m, "4: L1 Misses")
 	assert.Equal(t, 1, l2h, "4: L2 Hits")
