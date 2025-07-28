@@ -8,7 +8,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/orgball2608/gorge/gorge"
+	"github.com/orgball2608/gorge"
 
 	"github.com/redis/go-redis/v9"
 )

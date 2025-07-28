@@ -3,7 +3,7 @@ package gorge
 import (
 	"testing"
 
-	"github.com/orgball2608/gorge/gorge/internal/payload"
+	"github.com/orgball2608/gorge/internal/payload"
 	"github.com/stretchr/testify/assert"
 )
 

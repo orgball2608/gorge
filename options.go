@@ -23,7 +23,6 @@ type Options struct {
 	Logger                     *slog.Logger
 	Metrics                    Metrics
 	EnableStaleWhileRevalidate bool
-	// [CHANGE] Add StaleTTL to clarify SWR logic
 	// If the remaining TTL of a key is less than this value, SWR will be triggered. Default is 1 minute.
 	StaleTTL         time.Duration
 	NegativeCacheTTL time.Duration
@@ -41,6 +40,13 @@ type Options struct {
 	DisableCacheDelete bool
 	// Timeout for background refresh operations. Default is 10 seconds.
 	RefreshTimeout time.Duration
+
+	// Circuit Breaker settings
+	EnableCircuitBreaker bool
+	// Number of consecutive failures before opening the circuit.
+	CircuitBreakerMaxFailures uint32
+	// Period of time to wait before transitioning from open to half-open.
+	CircuitBreakerTimeout time.Duration
 }
 
 // Option is a function to configure Options.
@@ -61,7 +67,7 @@ func NewDefaultOptions() *Options {
 		Logger:                     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Metrics:                    &noOpMetrics{},
 		EnableStaleWhileRevalidate: false,
-		StaleTTL:                   1 * time.Minute, // [CHANGE] Add default value
+		StaleTTL:                   1 * time.Minute,
 		NegativeCacheTTL:           1 * time.Minute,
 		ExpirationJitter:           0.1,
 
@@ -72,6 +78,11 @@ func NewDefaultOptions() *Options {
 		DisableCacheRead:   false,
 		DisableCacheDelete: false,
 		RefreshTimeout:     10 * time.Second,
+
+		// Default Circuit Breaker settings
+		EnableCircuitBreaker:      true,
+		CircuitBreakerMaxFailures: 5,
+		CircuitBreakerTimeout:     5 * time.Second,
 	}
 }
 
@@ -154,4 +165,19 @@ func WithCacheDeleteDisabled(disabled bool) Option {
 // WithRefreshTimeout sets the timeout for background refresh operations.
 func WithRefreshTimeout(timeout time.Duration) Option {
 	return func(o *Options) { o.RefreshTimeout = timeout }
+}
+
+// WithCircuitBreaker enables the circuit breaker.
+func WithCircuitBreaker(enable bool) Option {
+	return func(o *Options) { o.EnableCircuitBreaker = enable }
+}
+
+// WithCircuitBreakerMaxFailures sets the number of consecutive failures before opening the circuit.
+func WithCircuitBreakerMaxFailures(failures uint32) Option {
+	return func(o *Options) { o.CircuitBreakerMaxFailures = failures }
+}
+
+// WithCircuitBreakerTimeout sets the period of time to wait before transitioning from open to half-open.
+func WithCircuitBreakerTimeout(timeout time.Duration) Option {
+	return func(o *Options) { o.CircuitBreakerTimeout = timeout }
 }

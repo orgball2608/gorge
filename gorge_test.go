@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto"
+	"github.com/orgball2608/gorge/internal/payload"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/testcontainers/testcontainers-go"
@@ -490,6 +491,130 @@ func TestGorge_DisabledCaches(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, int64(1), exists, "Key should not be deleted from L2 when delete is disabled")
 	})
+}
+
+func TestGorge_CacheTagging(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-tagging"
+	g, err := New[string](rdb, WithNamespace(ns))
+	assert.NoError(t, err)
+	defer g.Close()
+
+	fn := func(ctx context.Context) (string, error) {
+		return "some-value", nil
+	}
+
+	// 1. Set keys with tags
+	_, err = g.Fetch(ctx, "key1", time.Hour, fn, "tag1", "tag2")
+	assert.NoError(t, err)
+	_, err = g.Fetch(ctx, "key2", time.Hour, fn, "tag2")
+	assert.NoError(t, err)
+	_, err = g.Fetch(ctx, "key3", time.Hour, fn, "tag3")
+	assert.NoError(t, err)
+
+	// 2. Verify tags are set in Redis
+	tag1Members, err := rdb.SMembers(ctx, g.tagKey("tag1")).Result()
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{g.prefixedKey("key1")}, tag1Members)
+
+	tag2Members, err := rdb.SMembers(ctx, g.tagKey("tag2")).Result()
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{g.prefixedKey("key1"), g.prefixedKey("key2")}, tag2Members)
+
+	// 3. Invalidate "tag2"
+	err = g.InvalidateTags(ctx, "tag2")
+	assert.NoError(t, err)
+
+	// 4. Verify keys with "tag2" are deleted
+	assert.Eventually(t, func() bool {
+		exists, _ := rdb.Exists(ctx, g.prefixedKey("key1")).Result()
+		return exists == 0
+	}, time.Second, 50*time.Millisecond)
+
+	assert.Eventually(t, func() bool {
+		exists, _ := rdb.Exists(ctx, g.prefixedKey("key2")).Result()
+		return exists == 0
+	}, time.Second, 50*time.Millisecond)
+
+	// 5. Verify key without "tag2" still exists
+	exists, err := rdb.Exists(ctx, g.prefixedKey("key3")).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), exists, "key3 should still exist")
+
+	// 6. Verify tag sets are deleted
+	exists, err = rdb.Exists(ctx, g.tagKey("tag1")).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), exists, "tag1 should still exist") // key1 was part of it
+
+	exists, err = rdb.Exists(ctx, g.tagKey("tag2")).Result()
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), exists, "tag2 should be deleted")
+}
+
+func TestGorge_Set(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-set"
+	key := "set-key"
+	value1 := "value1"
+	value2 := "value2"
+
+	g1, err := New[string](rdb, WithNamespace(ns))
+	assert.NoError(t, err)
+	defer g1.Close()
+
+	g2, err := New[string](rdb, WithNamespace(ns))
+	assert.NoError(t, err)
+	defer g2.Close()
+
+	// Allow time for pubsub listeners to connect
+	time.Sleep(100 * time.Millisecond)
+
+	// 1. g1 sets a value
+	err = g1.Set(ctx, key, value1, time.Hour)
+	assert.NoError(t, err)
+
+	// 2. Verify g1 has it in L1 eventually
+	assert.Eventually(t, func() bool {
+		v1, ok := g1.l1.Get(g1.prefixedKey(key))
+		if !ok {
+			return false
+		}
+		pl, ok_cast := v1.(payload.CachePayload[string])
+		if !ok_cast {
+			return false
+		}
+		return assert.ObjectsAreEqual(value1, pl.Data)
+	}, time.Second, 10*time.Millisecond, "g1 should have the value in L1 after Set")
+
+	// 3. Verify g2 can fetch it from L2
+	val, err := g2.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		t.Fail() // Should not be called
+		return "", nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, value1, val)
+
+	// 4. Verify g2 now has it in L1
+	_, ok := g2.l1.Get(g2.prefixedKey(key))
+	assert.True(t, ok)
+
+	// 5. g1 sets a new value for the same key
+	err = g1.Set(ctx, key, value2, time.Hour)
+	assert.NoError(t, err)
+
+	// 6. Verify g2's L1 cache for that key is invalidated
+	assert.Eventually(t, func() bool {
+		_, ok := g2.l1.Get(g2.prefixedKey(key))
+		return !ok
+	}, time.Second, 50*time.Millisecond, "g2's L1 cache should be invalidated after Set")
+
+	// 7. Verify fetching from g2 gets the new value
+	val, err = g2.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		t.Fail() // Should not be called
+		return "", nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, value2, val)
 }
 
 func BenchmarkFetch_L1Hit(b *testing.B) {
