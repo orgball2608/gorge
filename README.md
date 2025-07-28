@@ -10,7 +10,7 @@
     <a href="https://goreportcard.com/report/github.com/orgball2608/gorge"><img src="https://goreportcard.com/badge/github.com/orgball2608/gorge" alt="Go Report Card" /></a>
     <a href="https://github.com/orgball2608/gorge/actions/workflows/ci.yml"><img src="https://github.com/orgball2608/gorge/actions/workflows/ci.yml/badge.svg" alt="Tests"></a>
     <a href='https://coveralls.io/github/orgball2608/gorge?branch=master'><img src='https://coveralls.io/repos/github/orgball2608/gorge/badge.svg?branch=master' alt='Coverage Status' /></a>
-    <a href="https://github.com/orgball2608/gorge/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license" /></a>
+    <a href="https://github.com/orgball2608/gorge/blob/master/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license" /></a>
   </p>
 </div>
 
