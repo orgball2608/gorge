@@ -8,12 +8,16 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto"
+	"github.com/google/uuid"
 	"github.com/orgball2608/gorge/gorge/internal/payload"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
 
-var ErrNotFound = errors.New("gorge: resource not found")
+var (
+	ErrNotFound         = errors.New("gorge: resource not found")
+	ErrLuaScriptFailure = errors.New("gorge: unexpected response from lua script")
+)
 
 type Cache[T any] struct {
 	opts               *Options
@@ -45,7 +49,7 @@ func New[T any](redisClient redis.UniversalClient, opts ...Option) (*Cache[T], e
 		ctx:                ctx,
 		cancel:             cancel,
 		rand:               rand.New(rand.NewSource(time.Now().UnixNano())),
-		ownerID:            fmt.Sprintf("gorge-owner-%d", time.Now().UnixNano()),
+		ownerID:            uuid.NewString(),
 		lockAndGetScript:   redis.NewScript(tryLockAndGetScript),
 		setAndUnlockScript: redis.NewScript(setDataAndUnlockScript),
 	}
@@ -74,7 +78,7 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 		}
 		if c.opts.EnableStaleWhileRevalidate && pl.IsStale(c.opts.StaleTTL) {
 			c.opts.Logger.Debug("L1 cache hit (stale), refreshing in background", "key", prefixedKey)
-			go c.refresh(context.Background(), prefixedKey, ttl, fn)
+			go c.refresh(prefixedKey, ttl, fn)
 		}
 		c.opts.Logger.Debug("L1 cache hit", "key", prefixedKey)
 		return pl.Data, nil
@@ -101,8 +105,8 @@ func (c *Cache[T]) Fetch(ctx context.Context, key string, ttl time.Duration, fn 
 
 			results, ok := res.([]interface{})
 			if !ok || len(results) < 2 {
-				c.opts.Logger.Warn("Unexpected response from lockAndGet script, proceeding to DB", "key", prefixedKey, "response", res)
-				return c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
+				c.opts.Logger.Error("Unexpected response from lockAndGet script", "key", prefixedKey, "response", res)
+				return nil, ErrLuaScriptFailure
 			}
 
 			value, status := results[0], results[1].(string)
@@ -164,7 +168,7 @@ func (c *Cache[T]) handleL2Hit(ctx context.Context, prefixedKey, l2Val string, t
 	}
 
 	if c.opts.EnableStaleWhileRevalidate && pl.IsStale(c.opts.StaleTTL) {
-		go c.refresh(context.Background(), prefixedKey, ttl, fn)
+		go c.refresh(prefixedKey, ttl, fn)
 	}
 	return pl, nil
 }
@@ -209,10 +213,13 @@ func (c *Cache[T]) setCacheAndUnlock(ctx context.Context, key string, pl payload
 	c.l1.SetWithTTL(key, pl, 1, min(c.opts.L1TTL, ttl))
 }
 
-func (c *Cache[T]) refresh(ctx context.Context, prefixedKey string, ttl time.Duration, fn func(ctx context.Context) (T, error)) {
+func (c *Cache[T]) refresh(prefixedKey string, ttl time.Duration, fn func(ctx context.Context) (T, error)) {
 	_, _, _ = c.sf.Do(prefixedKey+":refresh", func() (interface{}, error) {
+		refreshCtx, cancel := context.WithTimeout(c.ctx, c.opts.RefreshTimeout)
+		defer cancel()
+
 		c.opts.Logger.Debug("Background refresh started", "key", prefixedKey)
-		_, err := c.fetchFromDBAndSet(ctx, prefixedKey, ttl, fn)
+		_, err := c.fetchFromDBAndSet(refreshCtx, prefixedKey, ttl, fn)
 		if err != nil && !errors.Is(err, ErrNotFound) {
 			c.opts.Logger.Error("Background refresh failed", "key", prefixedKey, "error", err)
 		}

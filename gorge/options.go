@@ -39,6 +39,8 @@ type Options struct {
 	DisableCacheRead bool
 	// Skip cache deletion entirely.
 	DisableCacheDelete bool
+	// Timeout for background refresh operations. Default is 10 seconds.
+	RefreshTimeout time.Duration
 }
 
 // Option is a function to configure Options.
@@ -69,6 +71,7 @@ func NewDefaultOptions() *Options {
 		LockRetries:        5,
 		DisableCacheRead:   false,
 		DisableCacheDelete: false,
+		RefreshTimeout:     10 * time.Second,
 	}
 }
 
@@ -146,4 +149,9 @@ func WithCacheReadDisabled(disabled bool) Option {
 // WithCacheDeleteDisabled enables or disables cache deletion.
 func WithCacheDeleteDisabled(disabled bool) Option {
 	return func(o *Options) { o.DisableCacheDelete = disabled }
+}
+
+// WithRefreshTimeout sets the timeout for background refresh operations.
+func WithRefreshTimeout(timeout time.Duration) Option {
+	return func(o *Options) { o.RefreshTimeout = timeout }
 }

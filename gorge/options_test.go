@@ -21,6 +21,7 @@ func TestOptions(t *testing.T) {
 		assert.False(t, opts.EnableStaleWhileRevalidate)
 		assert.Equal(t, 1*time.Minute, opts.StaleTTL)
 		assert.Equal(t, 1*time.Minute, opts.NegativeCacheTTL)
+		assert.Equal(t, 10*time.Second, opts.RefreshTimeout)
 	})
 
 	t.Run("with custom options", func(t *testing.T) {
@@ -37,6 +38,7 @@ func TestOptions(t *testing.T) {
 		WithNegativeCacheTTL(2 * time.Minute)(opts)
 		WithStaleWhileRevalidate(true)(opts)
 		WithStaleTTL(30 * time.Second)(opts)
+		WithRefreshTimeout(5 * time.Second)(opts)
 
 		assert.Equal(t, "custom-ns", opts.Namespace)
 		assert.Equal(t, 10*time.Minute, opts.L1TTL)
@@ -46,5 +48,38 @@ func TestOptions(t *testing.T) {
 		assert.Equal(t, 2*time.Minute, opts.NegativeCacheTTL)
 		assert.True(t, opts.EnableStaleWhileRevalidate)
 		assert.Equal(t, 30*time.Second, opts.StaleTTL)
+		assert.Equal(t, 5*time.Second, opts.RefreshTimeout)
 	})
+}
+
+func TestWithExpirationJitter(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    float64
+		expected float64
+	}{
+		{
+			name:     "Jitter within range",
+			input:    0.5,
+			expected: 0.5,
+		},
+		{
+			name:     "Jitter less than 0",
+			input:    -0.1,
+			expected: 0,
+		},
+		{
+			name:     "Jitter greater than 1",
+			input:    1.5,
+			expected: 1,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := NewDefaultOptions()
+			WithExpirationJitter(tc.input)(opts)
+			assert.Equal(t, tc.expected, opts.ExpirationJitter)
+		})
+	}
 }

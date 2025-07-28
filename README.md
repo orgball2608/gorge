@@ -121,6 +121,15 @@ You can customize `gorge` with various `Option` functions.
 | `WithLogger(*slog.Logger)`   | Integrates your application's logger to monitor cache activity.                                   | `gorge.WithLogger(myLogger)`                    |
 | `WithCacheReadDisabled(b)`   | Disables reading from the cache, always calling `fn()` directly. Useful when Redis is down.       | `gorge.WithCacheReadDisabled(true)`             |
 
+### A Note on TTL
+
+It's important to understand how `gorge` handles the `ttl` parameter in the `Fetch` function:
+
+- **TTL is set on cache miss**: The `ttl` is only applied to the L2 cache (Redis) when there is a cache miss and the data is fetched from your source function (`fn`).
+- **TTL is NOT updated on cache hit**: When data is retrieved from the cache (L1 or L2), its existing expiration time is not modified. If you call `Fetch` with a new `ttl` for an existing key, it will not update the key's TTL in Redis.
+
+This design is intentional to minimize Redis commands on cache hits. If you need to update the TTL on every access, you would typically handle that logic in your application layer by explicitly deleting and re-fetching the key.
+
 ## 📊 Benchmarks
 
 Benchmarks were run on a local machine. To run them yourself, use the command `go test -bench=.` in the `gorge` directory.
