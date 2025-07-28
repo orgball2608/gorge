@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dgraph-io/ristretto"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/testcontainers/testcontainers-go"
@@ -295,6 +296,106 @@ func TestGorge_Delete_PubSub(t *testing.T) {
 		_, ok := g2.l1.Get(g2.prefixedKey(key))
 		return !ok
 	}, 200*time.Millisecond, 20*time.Millisecond, "g2 L1 cache should be deleted after pub/sub propagation")
+}
+
+func TestNew_RistrettoError(t *testing.T) {
+	// Ristretto fails to create a cache if NumCounters is not positive.
+	badL1Config := &ristretto.Config{
+		NumCounters: 0, // Invalid config
+		MaxCost:     1 << 30,
+		BufferItems: 64,
+	}
+	opts := NewDefaultOptions()
+	opts.L1Config = badL1Config
+
+	_, err := New[string](rdb, func(o *Options) {
+		o.L1Config = badL1Config
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to create L1 cache")
+}
+
+func TestFetch_LockRetriesExhausted(t *testing.T) {
+	ctx := context.Background()
+	key := "locked-key"
+
+	g, err := New[string](rdb,
+		WithNamespace("test-lock-exhausted"),
+		WithLockRetries(2),
+		WithLockSleep(10*time.Millisecond),
+	)
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// Manually acquire the lock with a different owner
+	prefixedKey := g.prefixedKey(key)
+	rdb.HSet(ctx, prefixedKey, "lockOwner", "another-owner")
+	rdb.Expire(ctx, prefixedKey, 10*time.Second)
+
+	// Fetch should now fail after retrying
+	_, err = g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		t.FailNow() // This function should never be called
+		return "", nil
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to acquire lock")
+
+	// Cleanup
+	rdb.Del(ctx, prefixedKey)
+}
+
+func TestHandleL2Hit_UnmarshalError(t *testing.T) {
+	ctx := context.Background()
+	key := "corrupted-key"
+	var fnCalls int32
+
+	g, err := New[string](rdb, WithNamespace("test-unmarshal-error"))
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// Manually set a corrupted value in L2
+	prefixedKey := g.prefixedKey(key)
+	rdb.HSet(ctx, prefixedKey, "value", "{not-a-valid-json")
+	rdb.Expire(ctx, prefixedKey, time.Hour)
+
+	// Fetch should fail to unmarshal, and then call the DB function
+	val, err := g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&fnCalls, 1)
+		return "good-value", nil
+	})
+
+	assert.NoError(t, err)
+	assert.Equal(t, "good-value", val)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls), "DB function should be called after unmarshal error")
+}
+
+func TestDelete_Disabled(t *testing.T) {
+	ctx := context.Background()
+	key := "no-delete-key"
+
+	g, err := New[string](rdb,
+		WithNamespace("test-delete-disabled"),
+		WithCacheDeleteDisabled(true),
+	)
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// Set a value
+	_, err = g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		return "some-value", nil
+	})
+	assert.NoError(t, err)
+
+	// Attempt to delete
+	err = g.Delete(ctx, key)
+	assert.NoError(t, err)
+
+	// Verify the key still exists in L2
+	prefixedKey := g.prefixedKey(key)
+	res := rdb.Exists(ctx, prefixedKey).Val()
+	assert.Equal(t, int64(1), res, "Key should still exist in Redis after disabled delete call")
 }
 
 func BenchmarkFetch_L1Hit(b *testing.B) {
