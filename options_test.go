@@ -61,34 +61,62 @@ func TestOptions(t *testing.T) {
 	})
 }
 
-func TestWithExpirationJitter(t *testing.T) {
-	testCases := []struct {
-		name     string
-		input    float64
-		expected float64
-	}{
-		{
-			name:     "Jitter within range",
-			input:    0.5,
-			expected: 0.5,
-		},
-		{
-			name:     "Jitter less than 0",
-			input:    -0.1,
-			expected: 0,
-		},
-		{
-			name:     "Jitter greater than 1",
-			input:    1.5,
-			expected: 1,
-		},
-	}
+func TestOptions_validate(t *testing.T) {
+	t.Run("valid options", func(t *testing.T) {
+		opts := NewDefaultOptions()
+		assert.NoError(t, opts.validate())
+	})
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			opts := NewDefaultOptions()
-			WithExpirationJitter(tc.input)(opts)
-			assert.Equal(t, tc.expected, opts.ExpirationJitter)
-		})
-	}
+	t.Run("invalid options", func(t *testing.T) {
+		testCases := []struct {
+			name    string
+			optFunc func(o *Options)
+			errMsg  string
+		}{
+			{
+				name: "StaleTTL >= LockTTL",
+				optFunc: func(o *Options) {
+					o.EnableStaleWhileRevalidate = true
+					o.StaleTTL = 10 * time.Second
+					o.LockTTL = 5 * time.Second
+				},
+				errMsg: "StaleTTL must be smaller than LockTTL",
+			},
+			{
+				name:    "Negative RefreshTimeout",
+				optFunc: func(o *Options) { o.RefreshTimeout = -1 },
+				errMsg:  "RefreshTimeout must be positive",
+			},
+			{
+				name:    "Negative L1TTL",
+				optFunc: func(o *Options) { o.L1TTL = 0 },
+				errMsg:  "L1TTL must be positive",
+			},
+			{
+				name:    "Negative LockTTL",
+				optFunc: func(o *Options) { o.LockTTL = 0 },
+				errMsg:  "LockTTL must be positive",
+			},
+			{
+				name:    "Negative Jitter",
+				optFunc: func(o *Options) { o.ExpirationJitter = -0.1 },
+				errMsg:  "ExpirationJitter must be between 0.0 and 1.0",
+			},
+			{
+				name:    "Invalid CircuitBreakerMaxFailures",
+				optFunc: func(o *Options) { o.EnableCircuitBreaker = true; o.CircuitBreakerMaxFailures = 0 },
+				errMsg:  "CircuitBreakerMaxFailures must be positive",
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				opts := NewDefaultOptions()
+				tc.optFunc(opts)
+				err := opts.validate()
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tc.errMsg)
+			})
+		}
+	})
 }

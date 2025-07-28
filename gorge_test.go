@@ -678,3 +678,42 @@ func BenchmarkFetch_DBHit(b *testing.B) {
 		_, _ = g.Fetch(ctx, fmt.Sprintf("%s-%d", key, i), 1*time.Hour, fn)
 	}
 }
+
+func TestCache_WithMsgPackSerializer(t *testing.T) {
+	ctx := context.Background()
+	ns := "test-msgpack"
+	key := "msgpack-key"
+
+	type testData struct {
+		Name  string
+		Value int
+	}
+
+	data := testData{Name: "gorge", Value: 123}
+
+	// Create a new cache with the MsgPack serializer
+	g, err := New[testData](rdb,
+		WithNamespace(ns),
+		WithSerializer(MsgPackSerializer{}),
+	)
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// Set the value using the cache
+	err = g.Set(ctx, key, data, time.Hour)
+	assert.NoError(t, err)
+
+	// Clear L1 to ensure we fetch from L2, testing the Unmarshal path
+	g.l1.Clear()
+
+	// Fetch the value back
+	fetchedData, err := g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (testData, error) {
+		// This function should not be called, as the value should be in the cache
+		t.Errorf("fetch function was called unexpectedly")
+		return testData{}, errors.New("should not be called")
+	})
+
+	// Assert that the fetched data is correct
+	assert.NoError(t, err)
+	assert.Equal(t, data, fetchedData)
+}

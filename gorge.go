@@ -41,6 +41,9 @@ func New[T any](redisClient redis.UniversalClient, opts ...Option) (*Cache[T], e
 	for _, opt := range opts {
 		opt(options)
 	}
+	if err := options.validate(); err != nil {
+		return nil, fmt.Errorf("invalid options: %w", err)
+	}
 	l1Cache, err := ristretto.NewCache(options.L1Config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create L1 cache: %w", err)

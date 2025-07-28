@@ -1,6 +1,7 @@
 package gorge
 
 import (
+	"errors"
 	"github.com/dgraph-io/ristretto"
 	"io"
 	"log/slog"
@@ -180,4 +181,43 @@ func WithCircuitBreakerMaxFailures(failures uint32) Option {
 // WithCircuitBreakerTimeout sets the period of time to wait before transitioning from open to half-open.
 func WithCircuitBreakerTimeout(timeout time.Duration) Option {
 	return func(o *Options) { o.CircuitBreakerTimeout = timeout }
+}
+
+func (o *Options) validate() error {
+	if o.EnableStaleWhileRevalidate && o.StaleTTL >= o.LockTTL {
+		return errors.New("StaleTTL must be smaller than LockTTL to avoid race conditions during refresh")
+	}
+	if o.RefreshTimeout <= 0 {
+		return errors.New("RefreshTimeout must be positive")
+	}
+	if o.L1TTL <= 0 {
+		return errors.New("L1TTL must be positive")
+	}
+	if o.LockTTL <= 0 {
+		return errors.New("LockTTL must be positive")
+	}
+	if o.NegativeCacheTTL <= 0 {
+		return errors.New("NegativeCacheTTL must be positive")
+	}
+	if o.StaleTTL <= 0 {
+		return errors.New("StaleTTL must be positive")
+	}
+	if o.LockSleep <= 0 {
+		return errors.New("LockSleep must be positive")
+	}
+	if o.LockRetries < 0 {
+		return errors.New("LockRetries must be non-negative")
+	}
+	if o.ExpirationJitter < 0 || o.ExpirationJitter > 1 {
+		return errors.New("ExpirationJitter must be between 0.0 and 1.0")
+	}
+	if o.EnableCircuitBreaker {
+		if o.CircuitBreakerMaxFailures <= 0 {
+			return errors.New("CircuitBreakerMaxFailures must be positive")
+		}
+		if o.CircuitBreakerTimeout <= 0 {
+			return errors.New("CircuitBreakerTimeout must be positive")
+		}
+	}
+	return nil
 }
