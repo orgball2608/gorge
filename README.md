@@ -20,21 +20,31 @@
 
 **Gorge** is a production-grade, type-safe, two-layer (in-memory + distributed) caching library for Go. It's designed to prevent cache stampedes (thundering herds), ensure high performance under heavy load, and provide advanced features like Stale-While-Revalidate and Negative Caching out of the box.
 
+## 🤔 Why Gorge?
+
+In high-traffic systems, uncached database queries can quickly become a bottleneck. While caching is a standard solution, a naive implementation can introduce new problems:
+- **Cache Stampede (Thundering Herd)**: When a popular cached item expires, multiple concurrent requests will all try to fetch the same data from the database simultaneously, overwhelming it.
+- **Latency Spikes**: Users experience slow responses whenever data needs to be fetched from the source.
+- **Boilerplate**: Implementing a robust caching strategy often involves writing complex, repetitive, and error-prone code.
+
+Gorge solves these problems by providing a simple, powerful, and production-ready caching layer that handles these complexities for you.
+
 ## ✨ Features
 
 *   **Two-Layer Cache**: Combines the speed of an in-memory cache (Ristretto) with the scalability of a distributed cache (Redis) to optimize read performance.
 *   **Type-Safe**: Leverages Go Generics to ensure type safety for cached data, minimizing runtime errors.
-*   **Thundering Herd Protection (Single-flight)**: Ensures that for the same key, only one goroutine fetches data from the source (e.g., database) during a cache miss.
+*   **Thundering Herd Protection**: Uses a `singleflight` mechanism to ensure that for any given key, only one goroutine fetches data from the source during a cache miss.
 *   **Stale-While-Revalidate (SWR)**: Instantly returns stale data while a background goroutine refreshes it, improving user-perceived latency.
 *   **Negative Caching**: Caches "not found" results to reduce load on the backend from repeated invalid requests.
 *   **Distributed Lock**: Uses a Redis lock to ensure consistency when updating the cache across multiple nodes.
-*   **Graceful Degradation**: Can automatically or manually disable cache reads/writes if Redis fails, ensuring the system remains operational.
-*   **Pub/Sub Invalidation**: Automatically invalidates the L1 (in-memory) cache on other nodes when a key is deleted or updated.
+*   **Graceful Degradation**: Can be configured to bypass the cache and fetch directly from the source if Redis is unavailable.
+*   **Pub/Sub Invalidation**: Automatically invalidates the L1 (in-memory) cache on other nodes when a key is deleted.
+*   **Customizable**: Offers a flexible options pattern for tuning TTLs, logging, metrics, and more.
 
 ## 🚀 Installation
 
 ```bash
-go get github.com/orgball2608/gorge
+go get github.com/orgball2608/gorge/gorge
 ```
 
 ## ⚡️ Quick Start
@@ -60,14 +70,15 @@ type User struct {
 	Name string `json:"name"`
 }
 
-// fetchUserFromDB simulates fetching a user from a database.
+// A mock database call
 func fetchUserFromDB(ctx context.Context, userID int) (User, error) {
 	slog.Info("--- ❗️ FETCHING FROM DATABASE ---", "userID", userID)
 	time.Sleep(100 * time.Millisecond) // Simulate DB latency
 	if userID == 101 {
 		return User{ID: 101, Name: "Alice"}, nil
 	}
-	return User{}, gorge.ErrNotFound // Use for negative caching
+	// Use gorge.ErrNotFound for negative caching
+	return User{}, gorge.ErrNotFound
 }
 
 func main() {
@@ -92,55 +103,101 @@ func main() {
 	// 3. Fetch data
 	// The first time, data will be fetched from `fetchUserFromDB`
 	fmt.Println("--- First fetch (cache miss) ---")
-	user, _ := cache.Fetch(ctx, "user:101", time.Hour, func(ctx context.Context) (User, error) {
+	user, err := cache.Fetch(ctx, "user:101", time.Hour, func(ctx context.Context) (User, error) {
 		return fetchUserFromDB(ctx, 101)
 	})
-	fmt.Printf("Got user: %+v\n\n", user)
+	if err != nil {
+		slog.Error("Fetch failed", "error", err)
+	} else {
+		fmt.Printf("Got user: %+v\n\n", user)
+	}
 
 	// The second time, data will be retrieved instantly from the cache (in-memory)
 	fmt.Println("--- Second fetch (cache hit) ---")
-	user, _ = cache.Fetch(ctx, "user:101", time.Hour, func(ctx context.Context) (User, error) {
+	user, err = cache.Fetch(ctx, "user:101", time.Hour, func(ctx context.Context) (User, error) {
 		return fetchUserFromDB(ctx, 101)
 	})
-	fmt.Printf("Got user: %+v\n", user)
+	if err != nil {
+		slog.Error("Fetch failed", "error", err)
+	} else {
+		fmt.Printf("Got user: %+v\n", user)
+	}
 }
 ```
 
-## 🛠️ Advanced Configuration
+## 🛠️ Configuration Options
 
-You can customize `gorge` with various `Option` functions.
+You can customize `gorge` with various `Option` functions passed to `gorge.New()`.
 
-| Option                       | Description                                                                                       | Example                                         |
-| ---------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| `WithNamespace(string)`      | Sets a prefix for all Redis keys to prevent collisions.                                           | `gorge.WithNamespace("production")`             |
-| `WithL1TTL(time.Duration)`   | Default Time-To-Live (TTL) for the L1 (in-memory) cache.                                          | `gorge.WithL1TTL(10 * time.Minute)`             |
-| `WithNegativeCacheTTL(t)`    | TTL for negative cache entries (when the fetch function returns `gorge.ErrNotFound`).             | `gorge.WithNegativeCacheTTL(5 * time.Second)`   |
-| `WithStaleWhileRevalidate(b)`| Enables or disables SWR mode.                                                                     | `gorge.WithStaleWhileRevalidate(true)`          |
-| `WithStaleTTL(t)`            | When a key's remaining TTL is less than this value, SWR will be triggered.                        | `gorge.WithStaleTTL(30 * time.Second)`          |
-| `WithLockTTL(t)`             | The TTL for the distributed lock. Must be longer than the slowest `fn()` execution time.          | `gorge.WithLockTTL(10 * time.Second)`           |
-| `WithLogger(*slog.Logger)`   | Integrates your application's logger to monitor cache activity.                                   | `gorge.WithLogger(myLogger)`                    |
-| `WithCacheReadDisabled(b)`   | Disables reading from the cache, always calling `fn()` directly. Useful when Redis is down.       | `gorge.WithCacheReadDisabled(true)`             |
+| Option                       | Description                                                                                       | Default                               |
+| ---------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `WithNamespace(string)`      | Sets a prefix for all Redis keys to prevent collisions.                                           | `"gocache"`                           |
+| `WithL1TTL(time.Duration)`   | Default Time-To-Live (TTL) for the L1 (in-memory) cache.                                          | `5 * time.Minute`                     |
+| `WithNegativeCacheTTL(t)`    | TTL for negative cache entries (when `fn` returns `gorge.ErrNotFound`).                           | `1 * time.Minute`                     |
+| `WithStaleWhileRevalidate(b)`| Enables or disables SWR mode. When enabled, returns stale data while refreshing in the background.| `false`                               |
+| `WithStaleTTL(t)`            | If SWR is enabled, a key is considered stale when its remaining TTL is less than this value.      | `1 * time.Minute`                     |
+| `WithLockTTL(t)`             | The TTL for the distributed lock in Redis. Must be longer than the slowest `fn()` execution.      | `10 * time.Second`                    |
+| `WithLockSleep(t)`           | The duration to wait before retrying to acquire a lock.                                           | `50 * time.Millisecond`               |
+| `WithLockRetries(int)`       | The number of times to retry acquiring a lock.                                                    | `10`                                  |
+| `WithExpirationJitter(f)`    | A factor (0.0 to 1.0) to add jitter to Redis TTLs, preventing mass expirations.                   | `0.0` (disabled)                      |
+| `WithLogger(*slog.Logger)`   | Integrates your application's logger to monitor cache activity.                                   | `slog.Default()` (discard handler)    |
+| `WithMetrics(Metrics)`       | Provides an interface to track cache hits, misses, and errors.                                    | `noOpMetrics`                         |
+| `WithCacheReadDisabled(b)`   | Disables reading from the cache, always calling `fn()` directly. Useful for graceful degradation. | `false`                               |
+| `WithCacheDeleteDisabled(b)` | Disables deleting from the cache.                                                                 | `false`                               |
 
-### A Note on TTL
+## 📊 Metrics
 
-It's important to understand how `gorge` handles the `ttl` parameter in the `Fetch` function:
+You can monitor the performance of Gorge by implementing the `Metrics` interface and passing it to the `WithMetrics` option.
 
-- **TTL is set on cache miss**: The `ttl` is only applied to the L2 cache (Redis) when there is a cache miss and the data is fetched from your source function (`fn`).
-- **TTL is NOT updated on cache hit**: When data is retrieved from the cache (L1 or L2), its existing expiration time is not modified. If you call `Fetch` with a new `ttl` for an existing key, it will not update the key's TTL in Redis.
+```go
+import (
+    "fmt"
+    "sync"
+    "github.com/orgball2608/gorge/gorge"
+)
 
-This design is intentional to minimize Redis commands on cache hits. If you need to update the TTL on every access, you would typically handle that logic in your application layer by explicitly deleting and re-fetching the key.
+// myMetrics is a custom implementation of the Metrics interface.
+type myMetrics struct {
+	mu      sync.Mutex
+	l1Hits  int
+	l1Miss  int
+	l2Hits  int
+	l2Miss  int
+	dbFetch int
+	dbError int
+}
 
-## 📊 Benchmarks
+func (m *myMetrics) IncL1Hits()    { m.mu.Lock(); m.l1Hits++; m.mu.Unlock() }
+func (m *myMetrics) IncL1Misses()  { m.mu.Lock(); m.l1Miss++; m.mu.Unlock() }
+func (m *myMetrics) IncL2Hits()    { m.mu.Lock(); m.l2Hits++; m.mu.Unlock() }
+func (m *myMetrics) IncL2Misses()  { m.mu.Lock(); m.l2Miss++; m.mu.Unlock() }
+func (m *myMetrics) IncDBFetches() { m.mu.Lock(); m.dbFetch++; m.mu.Unlock() }
+func (m *myMetrics) IncDBErrors()  { m.mu.Lock(); m.dbError++; m.mu.Unlock() }
 
-Benchmarks were run on a local machine. To run them yourself, use the command `go test -bench=.` in the `gorge` directory.
+func (m *myMetrics) Print() {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    fmt.Printf("L1 Hits: %d, L1 Misses: %d, L2 Hits: %d, L2 Misses: %d\n", m.l1Hits, m.l1Miss, m.l2Hits, m.l2Miss)
+}
 
-| Benchmark          | Description                               | Result (ns/op)                 |
-| ------------------ | ----------------------------------------- | ------------------------------ |
-| `BenchmarkFetch_L1Hit` | Fetches data from the L1 (in-memory) cache | *(run 'go test -bench=.')*     |
-| `BenchmarkFetch_L2Hit` | Fetches data from the L2 (Redis) cache     | *(run 'go test -bench=.')*     |
-| `BenchmarkFetch_DBHit` | Fetches data from the source (cache miss)  | *(run 'go test -bench=.')*     |
+// --- In your main function ---
+metrics := &myMetrics{}
+cache, err := gorge.New[User](redisClient, gorge.WithMetrics(metrics))
+// ... use the cache
+metrics.Print()
+```
 
-*Note: Actual results will vary depending on your environment.*
+## 📈 Benchmarks
+
+Benchmarks were run on a local M1 Mac. To run them yourself, use the command `go test -bench=. ./gorge/...`.
+
+| Benchmark          | Description                               | Result (ns/op) |
+| ------------------ | ----------------------------------------- | -------------- |
+| `BenchmarkFetch_L1Hit` | Fetches data from the L1 (in-memory) cache | `253.5 ns/op`  |
+| `BenchmarkFetch_L2Hit` | Fetches data from the L2 (Redis) cache     | `224.1 ns/op`  |
+| `BenchmarkFetch_DBHit` | Fetches data from the source (cache miss)  | `918409 ns/op` |
+
+*Note: Actual results will vary depending on your environment and network latency.*
 
 ## ❤️ Contributing
 
