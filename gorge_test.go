@@ -174,6 +174,109 @@ func TestGorge_Fetch_ThunderingHerd(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls), "fn should only be called once during a thundering herd")
 }
 
+func TestGorge_Fetch_Singleflight_L1Race(t *testing.T) {
+	ctx := context.Background()
+	key := "herd-l1-race-key"
+	value := "herd-l1-race-value"
+
+	var fnCalls int32
+	// This channel will block the first goroutine inside the singleflight function
+	blocker := make(chan struct{})
+	// This channel signals that the L1 cache has been populated by the test's main goroutine
+	l1Populated := make(chan struct{})
+
+	fn := func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&fnCalls, 1)
+		// The first goroutine to enter will block here
+		<-blocker
+		return value, nil
+	}
+
+	g, err := New[string](rdb, WithNamespace("test-l1-race"))
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// Clear key to ensure a miss
+	_ = g.Delete(ctx, key)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Start the first goroutine, which will enter the singleflight func and block
+	go func() {
+		defer wg.Done()
+		// This call will populate L1 via the sf.Do function body
+		_, _ = g.Fetch(ctx, key, time.Hour, fn)
+	}()
+
+	// Give the goroutine time to enter the singleflight function
+	time.Sleep(50 * time.Millisecond)
+
+	// Now, manually populate the L1 cache, simulating a race where another
+	// process or thread completes the work and populates L1.
+	// This is the path we want to test: `if val, found := c.l1.Get(prefixedKey); found`
+	// inside the singleflight.Do().
+	// To do this, we need a second goroutine that *also* calls fetch.
+	// Let's adjust the test.
+
+	// --- Resetting the test logic ---
+	atomic.StoreInt32(&fnCalls, 0)
+	_ = g.Delete(ctx, key)
+	blocker = make(chan struct{})
+	fn = func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&fnCalls, 1)
+		// The first goroutine blocks, the others wait on the singleflight.
+		// When this returns, the followers will re-check L1.
+		close(l1Populated) // Signal that the "work" is done
+		time.Sleep(50 * time.Millisecond)
+		return value, nil
+	}
+
+	// The key is that the followers in sf.Do should check L1 again.
+	// The current ThunderingHerd test actually covers this implicitly.
+	// Let's make it explicit.
+
+	// We need two cache instances to test the L1 population for followers.
+	g1, _ := New[string](rdb, WithNamespace("test-l1-race-2"))
+	g2, _ := New[string](rdb, WithNamespace("test-l1-race-2"))
+	defer g1.Close()
+	defer g2.Close()
+
+	_ = g1.Delete(ctx, key)
+	fn = func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&fnCalls, 1)
+		time.Sleep(100 * time.Millisecond)
+		return value, nil
+	}
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// g1 will do the fetch, g2 will be a follower
+			val, err := g1.Fetch(ctx, key, time.Hour, fn)
+			assert.NoError(t, err)
+			assert.Equal(t, value, val)
+		}()
+	}
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			val, err := g2.Fetch(ctx, key, time.Hour, fn)
+			assert.NoError(t, err)
+			assert.Equal(t, value, val)
+		}()
+	}
+
+	wg.Wait()
+	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls))
+
+	// Now, the crucial check. g2 was a "follower". Did it populate its L1 cache?
+	_, ok := g2.l1.Get(g2.prefixedKey(key))
+	assert.True(t, ok, "Follower instance g2 should have populated its L1 cache")
+}
+
 func TestGorge_Fetch_StaleWhileRevalidate(t *testing.T) {
 	ctx := context.Background()
 	key := "stale-key"
@@ -224,6 +327,93 @@ func TestGorge_Fetch_StaleWhileRevalidate(t *testing.T) {
 	v, err = g.Fetch(ctx, key, mainTTL, fn)
 	assert.NoError(t, err)
 	assert.Equal(t, secondValue, v, "should return the new value from L1")
+}
+
+func TestGorge_Fetch_StaleWhileRevalidate_L2Hit(t *testing.T) {
+	ctx := context.Background()
+	key := "stale-key-l2"
+	value := "stale-value-l2"
+
+	var fnCalls int32
+	fn := func(ctx context.Context) (string, error) {
+		atomic.AddInt32(&fnCalls, 1)
+		return value, nil
+	}
+
+	mainTTL := 4 * time.Second
+	staleTTL := 3 * time.Second // Stale in the last 3s
+
+	g, err := New[string](rdb,
+		WithNamespace("test-swr-l2"),
+		WithStaleWhileRevalidate(true),
+		WithStaleTTL(staleTTL),
+	)
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// 1. Prime the cache
+	_, err = g.Fetch(ctx, key, mainTTL, fn)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls))
+
+	// 2. Wait until stale and clear L1
+	time.Sleep(2 * time.Second)
+	g.l1.Clear()
+
+	// 3. Fetch again. Should hit L2, return stale data, and trigger refresh.
+	v, err := g.Fetch(ctx, key, mainTTL, fn)
+	assert.NoError(t, err)
+	assert.Equal(t, value, v)
+
+	// 4. Verify refresh was triggered
+	assert.Eventually(t, func() bool {
+		return atomic.LoadInt32(&fnCalls) == 2
+	}, 100*time.Millisecond, 10*time.Millisecond, "background refresh should have been called")
+}
+
+func TestGorge_Fetch_StaleWhileRevalidate_RefreshFailure(t *testing.T) {
+	ctx := context.Background()
+	key := "stale-key-refresh-fail"
+	value := "value-that-will-fail"
+	refreshErr := errors.New("db is down")
+
+	var fnCalls int32
+	fn := func(ctx context.Context) (string, error) {
+		callNum := atomic.AddInt32(&fnCalls, 1)
+		if callNum == 1 {
+			return value, nil
+		}
+		return "", refreshErr
+	}
+
+	mainTTL := 4 * time.Second
+	staleTTL := 3 * time.Second
+
+	g, err := New[string](rdb,
+		WithNamespace("test-swr-fail"),
+		WithStaleWhileRevalidate(true),
+		WithStaleTTL(staleTTL),
+		WithRefreshTimeout(100*time.Millisecond),
+	)
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// 1. Prime the cache
+	_, err = g.Fetch(ctx, key, mainTTL, fn)
+	assert.NoError(t, err)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls))
+
+	// 2. Wait until stale
+	time.Sleep(2 * time.Second)
+
+	// 3. Fetch again to trigger the failing refresh
+	_, err = g.Fetch(ctx, key, mainTTL, fn)
+	assert.NoError(t, err)
+
+	// 4. Verify refresh was attempted
+	assert.Eventually(t, func() bool {
+		return atomic.LoadInt32(&fnCalls) == 2
+	}, 150*time.Millisecond, 20*time.Millisecond, "background refresh should have been attempted")
 }
 
 func TestGorge_GracefulDegradation(t *testing.T) {
@@ -371,6 +561,53 @@ func TestHandleL2Hit_UnmarshalError(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(&fnCalls), "DB function should be called after unmarshal error")
 }
 
+func TestGorge_RedisDown(t *testing.T) {
+	// This test needs its own Redis container to safely stop it.
+	ctx := context.Background()
+	redisContainer, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "redis:7-alpine",
+			ExposedPorts: []string{"6379/tcp"},
+			WaitingFor:   wait.ForLog("Ready to accept connections"),
+		},
+		Started: true,
+	})
+	assert.NoError(t, err)
+	defer func(redisContainer testcontainers.Container, ctx context.Context) {
+		err := redisContainer.Terminate(ctx)
+		if err != nil {
+			log.Printf("could not stop redis container: %s", err)
+		} else {
+			log.Println("Redis container stopped successfully")
+		}
+	}(redisContainer, ctx)
+
+	endpoint, err := redisContainer.Endpoint(ctx, "")
+	assert.NoError(t, err)
+	localRdb := redis.NewClient(&redis.Options{Addr: endpoint})
+	assert.NoError(t, localRdb.Ping(ctx).Err())
+
+	g, err := New[string](localRdb, WithNamespace("redis-down"))
+	assert.NoError(t, err)
+	defer g.Close()
+
+	fn := func(ctx context.Context) (string, error) { return "value", nil }
+
+	// Stop Redis
+	err = redisContainer.Stop(ctx, nil)
+	assert.NoError(t, err)
+
+	// Test Fetch failure
+	_, err = g.Fetch(ctx, "some-key", time.Hour, fn)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to run lockAndGet script")
+
+	// Test Delete failure
+	err = g.Delete(ctx, "some-key")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "connection refused") // Example error text
+}
+
 func TestDelete_Disabled(t *testing.T) {
 	ctx := context.Background()
 	key := "no-delete-key"
@@ -438,6 +675,27 @@ func TestSetCache_MarshalError(t *testing.T) {
 	prefixedKey := g.prefixedKey(key)
 	lockOwner := rdb.HGet(ctx, prefixedKey, "lockOwner").Val()
 	assert.Empty(t, lockOwner, "Lock should be released on marshal error")
+}
+
+func TestFetch_NegativeCache_SetError(t *testing.T) {
+	ctx := context.Background()
+	key := "neg-cache-set-error"
+
+	g, err := New[string](rdb,
+		WithNamespace("test-neg-cache-set-error"),
+		WithSerializer(mockSerializer{}), // This serializer will cause the error
+	)
+	assert.NoError(t, err)
+	defer g.Close()
+
+	// This fetch will get ErrNotFound from the function, then fail on setCacheAndUnlock
+	_, err = g.Fetch(ctx, key, time.Hour, func(ctx context.Context) (string, error) {
+		return "", ErrNotFound
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to set negative cache")
+	assert.Contains(t, err.Error(), "mock marshal error")
 }
 
 func TestGorge_DisabledCaches(t *testing.T) {
